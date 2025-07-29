@@ -1511,14 +1511,14 @@ class WebDashboard:
         finally:
             return ws
     
-    async def start(self):
-        """Start the web server"""
-        port = int(os.environ.get('PORT', 8080))
-        
-        runner = web.AppRunner(self.app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
+async def start(self):
+    """Start the web server"""
+    port = int(os.environ.get('PORT', 8080))
+    
+    runner = web.AppRunner(self.app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
         
         logger.info(f"""
         ╔═══════════════════════════════════════════════╗
@@ -1550,9 +1550,20 @@ async def main():
         await asyncio.sleep(60)
 
 if __name__ == '__main__':
+    # Print the port we're using
+    port = int(os.environ.get('PORT', 8080))
+    print(f"Starting server on port {port}")
+    
     # Check environment
     required = ['TG_API_ID', 'TG_API_HASH']
     missing = [var for var in required if not os.getenv(var)]
+    
+    if missing:
+        logger.warning(f"Missing environment variables: {', '.join(missing)}")
+        logger.info("Bot will run in limited mode")
+    
+    # Run
+    asyncio.run(main())
     
     if missing:
         logger.warning(f"Missing environment variables: {', '.join(missing)}")
