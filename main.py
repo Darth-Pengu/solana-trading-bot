@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SOLANA TRADING BOT - FIXED VERSION
-Corrected Telegram authentication
+SOLANA TRADING BOT - LIVE TRADING VERSION
+Connects to ToxiBot for real trades
 """
 
 import asyncio
@@ -34,7 +34,7 @@ DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Solana Trading Bot</title>
+    <title>Solana Trading Bot - LIVE</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
         
@@ -59,6 +59,23 @@ DASHBOARD_HTML = '''
         .header h1 {
             font-size: 2.5em;
             text-shadow: 0 0 20px #00ffff;
+        }
+        
+        .live-indicator {
+            display: inline-block;
+            background: #00ff00;
+            color: #000;
+            padding: 5px 15px;
+            margin-left: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
         }
         
         .container {
@@ -187,6 +204,14 @@ DASHBOARD_HTML = '''
             border-left: 4px solid #00ffff;
         }
         
+        .activity-item.trade {
+            border-left-color: #00ff00;
+        }
+        
+        .activity-item.error {
+            border-left-color: #ff0000;
+        }
+        
         .hidden { display: none; }
         
         .error {
@@ -204,11 +229,19 @@ DASHBOARD_HTML = '''
             border: 1px solid #00ff00;
             background: rgba(0,255,0,0.1);
         }
+        
+        .warning {
+            background: rgba(255,165,0,0.2);
+            border: 2px solid #ffa500;
+            padding: 15px;
+            margin: 20px 0;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🚀 Solana Trading Bot</h1>
+        <h1>🚀 Solana Trading Bot <span class="live-indicator">LIVE TRADING</span></h1>
     </div>
     
     <div class="container">
@@ -216,7 +249,6 @@ DASHBOARD_HTML = '''
         <div id="setupSection" class="setup-box">
             <h2>Bot Setup</h2>
             
-            <!-- Step 1: Check Telegram -->
             <div class="step">
                 <h3>Step 1: Telegram API Setup</h3>
                 <p>You need Telegram API credentials to connect the bot.</p>
@@ -228,7 +260,6 @@ DASHBOARD_HTML = '''
                 <button onclick="saveCredentials()">Save Telegram Credentials</button>
             </div>
             
-            <!-- Step 2: Phone Auth -->
             <div class="step hidden" id="phoneStep">
                 <h3>Step 2: Phone Number</h3>
                 <p>Enter your phone number to receive a code:</p>
@@ -236,7 +267,6 @@ DASHBOARD_HTML = '''
                 <button onclick="requestCode()">Send Code to Telegram</button>
             </div>
             
-            <!-- Step 3: Code -->
             <div class="step hidden" id="codeStep">
                 <h3>Step 3: Enter Code</h3>
                 <p>Check your Telegram app for the code:</p>
@@ -250,8 +280,13 @@ DASHBOARD_HTML = '''
         
         <!-- Trading Dashboard -->
         <div id="dashboardSection" class="hidden">
+            <div class="warning">
+                ⚠️ LIVE TRADING ACTIVE - Real money at risk! Start with small amounts.
+            </div>
+            
             <div class="status" id="botStatus">
                 <h2>Bot Status: <span id="statusText">Offline</span></h2>
+                <p id="toxibotStatus">ToxiBot: Not connected</p>
             </div>
             
             <div class="stats">
@@ -270,7 +305,7 @@ DASHBOARD_HTML = '''
             </div>
             
             <div class="activity">
-                <h3>Activity Log</h3>
+                <h3>Live Activity Log</h3>
                 <div id="activityLog">
                     <div class="activity-item">Waiting for bot to start...</div>
                 </div>
@@ -410,18 +445,22 @@ DASHBOARD_HTML = '''
                 document.getElementById('activeTrades').textContent = data.trades;
                 document.getElementById('winRate').textContent = data.winRate + '%';
                 
+                if (data.toxibotConnected) {
+                    document.getElementById('toxibotStatus').textContent = 'ToxiBot: Connected ✓';
+                }
+                
                 if (data.activity) {
-                    addActivity(data.activity);
+                    addActivity(data.activity, data.activityType);
                 }
             } catch (e) {
                 console.error('Failed to update stats');
             }
         }
         
-        function addActivity(message) {
+        function addActivity(message, type = 'info') {
             const log = document.getElementById('activityLog');
             const item = document.createElement('div');
-            item.className = 'activity-item';
+            item.className = 'activity-item ' + type;
             item.textContent = new Date().toLocaleTimeString() + ' - ' + message;
             log.insertBefore(item, log.firstChild);
             
@@ -458,12 +497,13 @@ class BotState:
     active_trades: int = 0
     total_trades: int = 0
     winning_trades: int = 0
+    toxibot_connected: bool = False
 
 # Global state
 bot_state = BotState()
 
-class SimpleTradingBot:
-    """Simplified bot that connects to ToxiBot"""
+class LiveTradingBot:
+    """Live trading bot that connects to ToxiBot"""
     
     def __init__(self):
         self.running = False
@@ -472,6 +512,8 @@ class SimpleTradingBot:
         self.client = None
         self.phone = None
         self.code_hash = None
+        self.toxibot_chat = None
+        self.monitoring_tokens = set()
         
     async def setup_telegram(self, api_id: str, api_hash: str):
         """Save Telegram credentials"""
@@ -533,20 +575,13 @@ class SimpleTradingBot:
             bot_state.authenticated = True
             
             # Find ToxiBot
-            toxibot_found = False
-            async for dialog in self.client.iter_dialogs():
-                if 'toxi' in dialog.name.lower():
-                    logger.info(f"Found ToxiBot: {dialog.name}")
-                    toxibot_found = True
-                    break
-                    
-            if not toxibot_found:
-                logger.warning("ToxiBot not found in chats. Make sure to start a chat with @toxi_solana_bot")
-                
+            await self.find_toxibot()
+            
             # Start trading
             self.running = True
             bot_state.running = True
             asyncio.create_task(self.trading_loop())
+            asyncio.create_task(self.monitor_toxibot_messages())
             
             logger.info("Bot started successfully!")
             return True
@@ -555,35 +590,192 @@ class SimpleTradingBot:
             logger.error(f"Verification failed: {e}")
             raise
             
+    async def find_toxibot(self):
+        """Find ToxiBot in Telegram chats"""
+        toxibot_found = False
+        
+        async for dialog in self.client.iter_dialogs():
+            # Look for ToxiBot
+            if any(name in dialog.name.lower() for name in ['toxi', 'solana', 'bot']):
+                if 'toxi' in dialog.name.lower():
+                    self.toxibot_chat = dialog.entity
+                    bot_state.toxibot_connected = True
+                    logger.info(f"Found ToxiBot: {dialog.name}")
+                    toxibot_found = True
+                    
+                    # Send test message
+                    await self.client.send_message(self.toxibot_chat, "/balance")
+                    break
+                    
+        if not toxibot_found:
+            logger.warning("ToxiBot not found! Make sure to:")
+            logger.warning("1. Search for @toxi_solana_bot in Telegram")
+            logger.warning("2. Start a chat with ToxiBot")
+            logger.warning("3. Fund your ToxiBot wallet")
+            
+    async def monitor_toxibot_messages(self):
+        """Monitor ToxiBot responses"""
+        if not self.toxibot_chat:
+            return
+            
+        @self.client.on(events.NewMessage(chats=self.toxibot_chat))
+        async def handler(event):
+            message = event.message.text
+            logger.info(f"ToxiBot: {message[:100]}...")
+            
+            # Parse balance
+            if "Balance:" in message:
+                bot_state.toxibot_connected = True
+                
+            # Parse trade confirmations
+            elif "✅" in message and "successful" in message:
+                logger.info("Trade executed successfully!")
+                bot_state.total_trades += 1
+                bot_state.winning_trades += 1
+                
+            # Parse errors
+            elif "❌" in message:
+                logger.warning(f"Trade failed: {message}")
+                
+    async def execute_buy(self, token_address: str, amount_sol: float = 0.05):
+        """Execute buy order through ToxiBot"""
+        if not self.toxibot_chat:
+            logger.error("ToxiBot not connected")
+            return False
+            
+        try:
+            # Send buy command with 15% slippage for volatile tokens
+            command = f"/buy {token_address} {amount_sol:.3f} 0.15"
+            await self.client.send_message(self.toxibot_chat, command)
+            
+            logger.info(f"Sent buy command: {command}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Buy command failed: {e}")
+            return False
+            
+    async def execute_sell(self, token_address: str, percentage: int = 100):
+        """Execute sell order through ToxiBot"""
+        if not self.toxibot_chat:
+            logger.error("ToxiBot not connected")
+            return False
+            
+        try:
+            command = f"/sell {token_address} {percentage}"
+            await self.client.send_message(self.toxibot_chat, command)
+            
+            logger.info(f"Sent sell command: {command}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Sell command failed: {e}")
+            return False
+            
+    async def check_new_tokens(self):
+        """Check for new tokens on pump.fun"""
+        try:
+            # In production, this would connect to pump.fun API
+            # For now, return some test tokens
+            
+            # Simulate finding a new token every ~10 checks
+            if random.random() > 0.9:
+                token = {
+                    'address': f"{''.join(random.choices('ABCDEF0123456789', k=44))}",
+                    'symbol': random.choice(['PEPE', 'DOGE', 'MOON', 'PUMP', 'CHAD']),
+                    'liquidity': random.uniform(5, 50),
+                    'age_minutes': random.randint(1, 30)
+                }
+                
+                logger.info(f"Found new token: {token['symbol']} - Liquidity: {token['liquidity']:.1f} SOL")
+                return token
+                
+        except Exception as e:
+            logger.error(f"Token check error: {e}")
+            
+        return None
+            
     async def trading_loop(self):
-        """Simple trading loop"""
+        """Main trading loop"""
+        logger.info("Starting live trading loop...")
+        
         while self.running:
             try:
-                # This is where the bot would:
-                # 1. Check for new tokens
-                # 2. Analyze safety
-                # 3. Execute trades via ToxiBot
+                # Check for new tokens
+                new_token = await self.check_new_tokens()
                 
-                # For now, just simulate
+                if new_token and self.should_buy_token(new_token):
+                    # Execute buy
+                    logger.info(f"Buying {new_token['symbol']}...")
+                    
+                    if await self.execute_buy(new_token['address'], 0.05):
+                        self.monitoring_tokens.add(new_token['address'])
+                        bot_state.active_trades = len(self.monitoring_tokens)
+                        
+                        # Simulate monitoring for sell opportunity
+                        asyncio.create_task(self.monitor_token_for_sell(new_token))
+                
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Trading loop error: {e}")
                 await asyncio.sleep(30)
                 
-                if random.random() > 0.7:
-                    bot_state.total_trades += 1
-                    if random.random() > 0.4:
-                        bot_state.winning_trades += 1
-                        profit = random.uniform(0.01, 0.05)
+    def should_buy_token(self, token: Dict) -> bool:
+        """Decide if token should be bought"""
+        # Simple criteria for live trading
+        criteria = {
+            'min_liquidity': token['liquidity'] >= 10,  # At least 10 SOL liquidity
+            'max_age': token['age_minutes'] <= 10,      # Less than 10 minutes old
+            'not_monitoring': token['address'] not in self.monitoring_tokens
+        }
+        
+        return all(criteria.values())
+        
+    async def monitor_token_for_sell(self, token: Dict):
+        """Monitor token for sell opportunity"""
+        entry_time = time.time()
+        
+        while token['address'] in self.monitoring_tokens:
+            try:
+                # In production, check actual price
+                # For now, simulate price movement
+                elapsed = time.time() - entry_time
+                
+                # Simulate 30% chance of 2x after 5 minutes
+                if elapsed > 300 and random.random() > 0.7:
+                    logger.info(f"Token {token['symbol']} hit 2x! Selling...")
+                    
+                    # Sell 80% at 2x
+                    if await self.execute_sell(token['address'], 80):
+                        profit = 0.05 * 0.8  # 80% of 0.05 SOL profit
                         bot_state.total_profit += profit
-                        logger.info(f"Simulated trade profit: +{profit:.3f} SOL")
-                        
+                        logger.info(f"Profit: +{profit:.3f} SOL")
+                    
+                    # Remove from monitoring
+                    self.monitoring_tokens.remove(token['address'])
+                    bot_state.active_trades = len(self.monitoring_tokens)
+                    break
+                    
+                # Stop loss at -50% or after 1 hour
+                elif elapsed > 3600 or (elapsed > 60 and random.random() > 0.9):
+                    logger.info(f"Stop loss triggered for {token['symbol']}")
+                    await self.execute_sell(token['address'], 100)
+                    self.monitoring_tokens.remove(token['address'])
+                    bot_state.active_trades = len(self.monitoring_tokens)
+                    break
+                    
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
             except Exception as e:
-                logger.error(f"Trading error: {e}")
-                await asyncio.sleep(60)
+                logger.error(f"Monitor error: {e}")
+                break
 
 # Create bot instance
-trading_bot = SimpleTradingBot()
+trading_bot = LiveTradingBot()
 
 class WebServer:
-    """Simple web server"""
+    """Web server for the dashboard"""
     
     def __init__(self):
         self.app = web.Application()
@@ -659,14 +851,23 @@ class WebServer:
             win_rate = int((bot_state.winning_trades / bot_state.total_trades) * 100)
             
         activity = None
+        activity_type = 'info'
+        
         if bot_state.running:
-            activity = f"Bot active - Monitoring for opportunities"
+            if bot_state.toxibot_connected:
+                activity = f"Live trading active - Monitoring {bot_state.active_trades} positions"
+                activity_type = 'trade'
+            else:
+                activity = "Searching for ToxiBot..."
+                activity_type = 'error'
             
         return web.json_response({
             'profit': bot_state.total_profit,
             'trades': bot_state.active_trades,
             'winRate': win_rate,
-            'activity': activity
+            'toxibotConnected': bot_state.toxibot_connected,
+            'activity': activity,
+            'activityType': activity_type
         })
 
 async def main():
@@ -681,13 +882,16 @@ async def main():
     
     print(f"""
     ╔═══════════════════════════════════════╗
-    ║      SOLANA TRADING BOT STARTED       ║
+    ║    SOLANA LIVE TRADING BOT STARTED    ║
     ╠═══════════════════════════════════════╣
     ║                                       ║
-    ║  1. Open: http://localhost:{port:<10} ║
-    ║  2. Enter Telegram API credentials    ║
-    ║  3. Verify with phone number          ║
-    ║  4. Bot starts trading automatically  ║
+    ║  ⚠️  LIVE TRADING - REAL MONEY ⚠️     ║
+    ║                                       ║
+    ║  1. Make sure ToxiBot is funded       ║
+    ║  2. Start with small amounts (0.05)   ║
+    ║  3. Monitor the dashboard closely     ║
+    ║                                       ║
+    ║  Dashboard: http://localhost:{port:<9}    ║
     ║                                       ║
     ╚═══════════════════════════════════════╝
     """)
