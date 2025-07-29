@@ -1511,31 +1511,31 @@ class WebDashboard:
         finally:
             return ws
     
-async def start(self):
-    """Start the web server"""
-    port = int(os.environ.get('PORT', 8080))
-    
-    runner = web.AppRunner(self.app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
+    async def start(self):
+        """Start the web server"""
+        port = int(os.environ.get('PORT', 8080))
         
-            logger.info(f"""
-        ╔═══════════════════════════════════════════════╗
-        ║           TRON TRADING SYSTEM                 ║
-        ╠═══════════════════════════════════════════════╣
-        ║                                               ║
-        ║  Dashboard: http://localhost:{port:<17}║
-        ║  Railway: https://YOUR-APP.railway.app        ║
-        ║                                               ║
-        ║  Status: AWAITING AUTHENTICATION              ║
-        ║                                               ║
-        ║  1. Visit dashboard                           ║
-        ║  2. Enter phone number                        ║
-        ║  3. Enter verification code                   ║
-        ║  4. Bot starts automatically!                 ║
-        ║                                               ║
-        ╚═══════════════════════════════════════════════╝
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"""
+╔═══════════════════════════════════════════════╗
+║           TRON TRADING SYSTEM                 ║
+╠═══════════════════════════════════════════════╣
+║                                               ║
+║  Dashboard: http://localhost:{port:<17}║
+║  Railway: https://YOUR-APP.railway.app        ║
+║                                               ║
+║  Status: AWAITING AUTHENTICATION              ║
+║                                               ║
+║  1. Visit dashboard                           ║
+║  2. Enter phone number                        ║
+║  3. Enter verification code                   ║
+║  4. Bot starts automatically!                 ║
+║                                               ║
+╚═══════════════════════════════════════════════╝
         """)
 
 async def main():
@@ -1557,13 +1557,6 @@ if __name__ == '__main__':
     # Check environment
     required = ['TG_API_ID', 'TG_API_HASH']
     missing = [var for var in required if not os.getenv(var)]
-    
-    if missing:
-        logger.warning(f"Missing environment variables: {', '.join(missing)}")
-        logger.info("Bot will run in limited mode")
-    
-    # Run
-    asyncio.run(main())
     
     if missing:
         logger.warning(f"Missing environment variables: {', '.join(missing)}")
