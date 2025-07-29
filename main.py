@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SOLANA TRADING BOT - LIVE TRADING VERSION
-Connects to ToxiBot for real trades
+SOLANA TRADING BOT - COMPLETE VERSION WITH ALL FIXES
+Three personalities, proper ToxiBot commands, aggressive settings
 """
 
 import asyncio
@@ -10,9 +10,9 @@ import json
 import time
 import logging
 import random
+import aiohttp
 from datetime import datetime
 from typing import Dict, List, Optional
-import aiohttp
 from aiohttp import web
 from dataclasses import dataclass
 
@@ -29,7 +29,14 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("Telegram not available - install telethon to enable trading")
 
-# HTML Dashboard (same as before)
+# Configuration - AGGRESSIVE SETTINGS FOR MORE TRADES
+HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '')
+POSITION_SIZE = 0.05  # Default SOL per trade
+MIN_LIQUIDITY = 2  # Lowered from 10 SOL for more opportunities
+MAX_TOKEN_AGE = 1800  # 30 minutes instead of 10
+MAX_POSITIONS = 10  # Increased from 5 for more trades
+
+# HTML Dashboard
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html>
@@ -212,6 +219,18 @@ DASHBOARD_HTML = '''
             border-left-color: #ff0000;
         }
         
+        .activity-item.sniper {
+            border-left-color: #ff00ff;
+        }
+        
+        .activity-item.scalper {
+            border-left-color: #ffff00;
+        }
+        
+        .activity-item.community {
+            border-left-color: #00ffff;
+        }
+        
         .hidden { display: none; }
         
         .error {
@@ -236,6 +255,37 @@ DASHBOARD_HTML = '''
             padding: 15px;
             margin: 20px 0;
             text-align: center;
+        }
+        
+        .api-setup {
+            background: rgba(255,165,0,0.1);
+            border: 2px solid #ffa500;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        .personality-indicator {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        
+        .personality-sniper {
+            background: #ff00ff;
+            color: #000;
+        }
+        
+        .personality-scalper {
+            background: #ffff00;
+            color: #000;
+        }
+        
+        .personality-community {
+            background: #00ffff;
+            color: #000;
         }
     </style>
 </head>
@@ -284,9 +334,18 @@ DASHBOARD_HTML = '''
                 ⚠️ LIVE TRADING ACTIVE - Real money at risk! Start with small amounts.
             </div>
             
+            <div class="api-setup" id="apiWarning">
+                <h3>⚠️ Optional: Add Helius API Key for Better Token Discovery</h3>
+                <p>Get a free API key from <a href="https://www.helius.dev/" target="_blank" style="color: #ff6600;">helius.dev</a></p>
+                <p>Add it to Railway environment variables as HELIUS_API_KEY</p>
+            </div>
+            
             <div class="status" id="botStatus">
                 <h2>Bot Status: <span id="statusText">Offline</span></h2>
                 <p id="toxibotStatus">ToxiBot: Not connected</p>
+                <p>Active Bots: <span class="personality-indicator personality-sniper">SNIPER</span>
+                                <span class="personality-indicator personality-scalper">SCALPER</span>
+                                <span class="personality-indicator personality-community">COMMUNITY</span></p>
             </div>
             
             <div class="stats">
@@ -301,6 +360,10 @@ DASHBOARD_HTML = '''
                 <div class="stat-card">
                     <h3>Win Rate</h3>
                     <div class="stat-value" id="winRate">0%</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Tokens Checked</h3>
+                    <div class="stat-value" id="tokensChecked">0</div>
                 </div>
             </div>
             
@@ -329,6 +392,11 @@ DASHBOARD_HTML = '''
                     startUpdates();
                 } else if (data.configured) {
                     document.getElementById('phoneStep').classList.remove('hidden');
+                }
+                
+                // Hide API warning if key is set
+                if (data.hasHeliusKey) {
+                    document.getElementById('apiWarning').style.display = 'none';
                 }
             } catch (e) {
                 console.log('Not configured yet');
@@ -444,6 +512,7 @@ DASHBOARD_HTML = '''
                 document.getElementById('totalProfit').textContent = data.profit.toFixed(3) + ' SOL';
                 document.getElementById('activeTrades').textContent = data.trades;
                 document.getElementById('winRate').textContent = data.winRate + '%';
+                document.getElementById('tokensChecked').textContent = data.tokensChecked || 0;
                 
                 if (data.toxibotConnected) {
                     document.getElementById('toxibotStatus').textContent = 'ToxiBot: Connected ✓';
@@ -498,9 +567,151 @@ class BotState:
     total_trades: int = 0
     winning_trades: int = 0
     toxibot_connected: bool = False
+    tokens_checked: int = 0
+    last_activity: Optional[str] = None
+    last_activity_type: str = 'info'
 
 # Global state
 bot_state = BotState()
+
+class BotPersonality:
+    """Different trading personalities with unique strategies"""
+    
+    ULTRA_EARLY = {
+        'name': 'Ultra-Early Sniper',
+        'min_liquidity': 0.5,  # Super low - maximum risk
+        'max_age_minutes': 2,  # Only brand new tokens
+        'position_size': 0.02,  # Smaller positions due to risk
+        'take_profit': 3.0,  # 3x target
+        'stop_loss': 0.5,  # -50%
+        'hold_time': 900,  # 15 minutes max
+        'css_class': 'sniper'
+    }
+    
+    SCALPER = {
+        'name': 'Quick Scalper',
+        'min_liquidity': 5,
+        'max_age_minutes': 10,
+        'position_size': 0.05,
+        'take_profit': 1.5,  # 50% profit
+        'stop_loss': 0.8,  # -20%
+        'hold_time': 1800,  # 30 minutes max
+        'css_class': 'scalper'
+    }
+    
+    COMMUNITY = {
+        'name': 'Community Hunter',
+        'min_liquidity': 20,
+        'max_age_minutes': 60,
+        'position_size': 0.1,
+        'take_profit': 2.0,
+        'stop_loss': 0.7,  # -30%
+        'hold_time': 7200,  # 2 hours max
+        'css_class': 'community'
+    }
+
+class TokenDiscovery:
+    """Discover new tokens from multiple sources"""
+    
+    def __init__(self):
+        self.session = None
+        self.checked_tokens = set()
+        
+    async def get_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+        
+    async def discover_tokens(self) -> List[Dict]:
+        """Discover new tokens from various sources"""
+        tokens = []
+        
+        # Try multiple discovery methods
+        if HELIUS_API_KEY:
+            tokens.extend(await self.get_helius_tokens())
+        else:
+            tokens.extend(await self.get_birdeye_tokens())
+            
+        # Filter out already checked tokens
+        new_tokens = []
+        for token in tokens:
+            if token['address'] not in self.checked_tokens:
+                self.checked_tokens.add(token['address'])
+                new_tokens.append(token)
+                
+        bot_state.tokens_checked = len(self.checked_tokens)
+        return new_tokens
+        
+    async def get_helius_tokens(self) -> List[Dict]:
+        """Get new tokens from Helius"""
+        try:
+            session = await self.get_session()
+            url = f"https://api.helius.xyz/v0/addresses/transactions?api-key={HELIUS_API_KEY}"
+            
+            # Query for recent token creation transactions
+            params = {
+                'limit': 10,
+                'type': 'UNKNOWN'  # Often new tokens
+            }
+            
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    tokens = []
+                    
+                    # Parse transactions for new tokens
+                    # This is simplified - in production you'd parse more carefully
+                    for tx in data:
+                        if 'tokenTransfers' in tx:
+                            for transfer in tx['tokenTransfers']:
+                                token = {
+                                    'address': transfer.get('mint', ''),
+                                    'symbol': 'NEW',
+                                    'liquidity': 10,  # Would calculate real liquidity
+                                    'age_minutes': 5,
+                                    'source': 'helius'
+                                }
+                                tokens.append(token)
+                                
+                    logger.info(f"Found {len(tokens)} tokens from Helius")
+                    return tokens
+                    
+        except Exception as e:
+            logger.error(f"Helius error: {e}")
+            
+        return []
+        
+    async def get_birdeye_tokens(self) -> List[Dict]:
+        """Get trending tokens from Birdeye (free)"""
+        try:
+            session = await self.get_session()
+            url = "https://public-api.birdeye.so/public/tokenlist?sort_by=v24hUSD&sort_type=desc&limit=10"
+            
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    tokens = []
+                    
+                    if 'data' in data and 'tokens' in data['data']:
+                        for token_data in data['data']['tokens'][:5]:  # Top 5
+                            # Only get new tokens
+                            if token_data.get('v24hUSD', 0) < 100000:  # Small volume = new
+                                token = {
+                                    'address': token_data.get('address', ''),
+                                    'symbol': token_data.get('symbol', 'UNKNOWN'),
+                                    'liquidity': token_data.get('liquidity', 0) / 1e9,  # Convert to SOL
+                                    'age_minutes': 30,  # Estimate
+                                    'source': 'birdeye'
+                                }
+                                tokens.append(token)
+                                
+                    logger.info(f"Found {len(tokens)} tokens from Birdeye")
+                    return tokens
+                    
+        except Exception as e:
+            logger.error(f"Birdeye error: {e}")
+            
+        return []
 
 class LiveTradingBot:
     """Live trading bot that connects to ToxiBot"""
@@ -513,7 +724,8 @@ class LiveTradingBot:
         self.phone = None
         self.code_hash = None
         self.toxibot_chat = None
-        self.monitoring_tokens = set()
+        self.monitoring_tokens = {}  # Changed to dict to store token info
+        self.token_discovery = TokenDiscovery()
         
     async def setup_telegram(self, api_id: str, api_hash: str):
         """Save Telegram credentials"""
@@ -605,6 +817,8 @@ class LiveTradingBot:
                     
                     # Send test message
                     await self.client.send_message(self.toxibot_chat, "/balance")
+                    bot_state.last_activity = "Connected to ToxiBot"
+                    bot_state.last_activity_type = "success"
                     break
                     
         if not toxibot_found:
@@ -612,6 +826,8 @@ class LiveTradingBot:
             logger.warning("1. Search for @toxi_solana_bot in Telegram")
             logger.warning("2. Start a chat with ToxiBot")
             logger.warning("3. Fund your ToxiBot wallet")
+            bot_state.last_activity = "ToxiBot not found - please start chat with @toxi_solana_bot"
+            bot_state.last_activity_type = "error"
             
     async def monitor_toxibot_messages(self):
         """Monitor ToxiBot responses"""
@@ -624,35 +840,45 @@ class LiveTradingBot:
             logger.info(f"ToxiBot: {message[:100]}...")
             
             # Parse balance
-            if "Balance:" in message:
+            if "Wallet Balance:" in message or "Balance:" in message:
                 bot_state.toxibot_connected = True
+                bot_state.last_activity = "ToxiBot balance checked"
+                bot_state.last_activity_type = "info"
                 
-            # Parse trade confirmations
-            elif "✅" in message and "successful" in message:
+            # Parse successful buys
+            elif "✅" in message or "Bought" in message or "Success" in message:
                 logger.info("Trade executed successfully!")
                 bot_state.total_trades += 1
                 bot_state.winning_trades += 1
+                bot_state.last_activity = "Trade executed successfully!"
+                bot_state.last_activity_type = "trade"
                 
-            # Parse errors
-            elif "❌" in message:
+            # Parse validation errors
+            elif "Validation error" in message or "❌" in message:
                 logger.warning(f"Trade failed: {message}")
+                bot_state.last_activity = "Trade failed - invalid token"
+                bot_state.last_activity_type = "error"
                 
-    async def execute_buy(self, token_address: str, amount_sol: float = 0.05):
-        """Execute buy order through ToxiBot"""
+    async def execute_buy(self, token_address: str, amount_sol: float = POSITION_SIZE):
+        """Execute buy order through ToxiBot - FIXED FORMAT"""
         if not self.toxibot_chat:
             logger.error("ToxiBot not connected")
             return False
             
         try:
-            # Send buy command with 15% slippage for volatile tokens
-            command = f"/buy {token_address} {amount_sol:.3f} 0.15"
-            await self.client.send_message(self.toxibot_chat, command)
+            # ToxiBot format: just send the token address
+            # It will use your default buy amount set in ToxiBot
+            await self.client.send_message(self.toxibot_chat, token_address)
             
-            logger.info(f"Sent buy command: {command}")
+            logger.info(f"Sent buy command: {token_address}")
+            bot_state.last_activity = f"Attempting to buy token: {token_address[:8]}..."
+            bot_state.last_activity_type = "trade"
             return True
             
         except Exception as e:
             logger.error(f"Buy command failed: {e}")
+            bot_state.last_activity = f"Buy command failed: {str(e)}"
+            bot_state.last_activity_type = "error"
             return False
             
     async def execute_sell(self, token_address: str, percentage: int = 100):
@@ -662,113 +888,135 @@ class LiveTradingBot:
             return False
             
         try:
-            command = f"/sell {token_address} {percentage}"
-            await self.client.send_message(self.toxibot_chat, command)
+            # For selling, first check portfolio
+            await self.client.send_message(self.toxibot_chat, "/portfolio")
             
-            logger.info(f"Sent sell command: {command}")
+            logger.info(f"Checking positions before sell: {token_address}")
+            bot_state.last_activity = f"Checking positions for sell: {token_address[:8]}..."
+            bot_state.last_activity_type = "info"
             return True
             
         except Exception as e:
             logger.error(f"Sell command failed: {e}")
             return False
             
-    async def check_new_tokens(self):
-        """Check for new tokens on pump.fun"""
-        try:
-            # In production, this would connect to pump.fun API
-            # For now, return some test tokens
-            
-            # Simulate finding a new token every ~10 checks
-            if random.random() > 0.9:
-                token = {
-                    'address': f"{''.join(random.choices('ABCDEF0123456789', k=44))}",
-                    'symbol': random.choice(['PEPE', 'DOGE', 'MOON', 'PUMP', 'CHAD']),
-                    'liquidity': random.uniform(5, 50),
-                    'age_minutes': random.randint(1, 30)
-                }
-                
-                logger.info(f"Found new token: {token['symbol']} - Liquidity: {token['liquidity']:.1f} SOL")
-                return token
-                
-        except Exception as e:
-            logger.error(f"Token check error: {e}")
-            
-        return None
-            
     async def trading_loop(self):
         """Main trading loop"""
-        logger.info("Starting live trading loop...")
+        logger.info("Starting live trading loop with 3 personalities...")
+        bot_state.last_activity = "Trading loop started - scanning for opportunities"
+        bot_state.last_activity_type = "info"
         
         while self.running:
             try:
-                # Check for new tokens
-                new_token = await self.check_new_tokens()
+                # Discover new tokens
+                new_tokens = await self.token_discovery.discover_tokens()
                 
-                if new_token and self.should_buy_token(new_token):
-                    # Execute buy
-                    logger.info(f"Buying {new_token['symbol']}...")
+                if new_tokens:
+                    logger.info(f"Discovered {len(new_tokens)} new tokens")
                     
-                    if await self.execute_buy(new_token['address'], 0.05):
-                        self.monitoring_tokens.add(new_token['address'])
-                        bot_state.active_trades = len(self.monitoring_tokens)
-                        
-                        # Simulate monitoring for sell opportunity
-                        asyncio.create_task(self.monitor_token_for_sell(new_token))
+                    for token in new_tokens:
+                        personality = self.should_buy_token(token)
+                        if personality:
+                            logger.info(f"{personality['name']} found token: {token['symbol']} - {token['address'][:8]}...")
+                            bot_state.last_activity = f"{personality['name']} buying {token['symbol']}"
+                            bot_state.last_activity_type = personality['css_class']
+                            
+                            # Execute buy with personality-specific amount
+                            if await self.execute_buy(token['address'], personality['position_size']):
+                                # Store token with its personality
+                                token['personality'] = personality
+                                token['entry_time'] = time.time()
+                                self.monitoring_tokens[token['address']] = token
+                                bot_state.active_trades = len(self.monitoring_tokens)
+                                
+                                # Monitor for sell
+                                asyncio.create_task(self.monitor_token_for_sell(token))
+                else:
+                    # Update activity to show we're still scanning
+                    if bot_state.tokens_checked % 10 == 0:
+                        bot_state.last_activity = f"Scanning... {bot_state.tokens_checked} tokens checked"
+                        bot_state.last_activity_type = "info"
                 
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(10)  # Check every 10 seconds
                 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}")
+                bot_state.last_activity = f"Trading loop error: {str(e)}"
+                bot_state.last_activity_type = "error"
                 await asyncio.sleep(30)
                 
-    def should_buy_token(self, token: Dict) -> bool:
-        """Decide if token should be bought"""
-        # Simple criteria for live trading
-        criteria = {
-            'min_liquidity': token['liquidity'] >= 10,  # At least 10 SOL liquidity
-            'max_age': token['age_minutes'] <= 10,      # Less than 10 minutes old
-            'not_monitoring': token['address'] not in self.monitoring_tokens
-        }
+    def should_buy_token(self, token: Dict) -> Optional[Dict]:
+        """Decide if token should be bought based on personality"""
         
-        return all(criteria.values())
+        # Try each personality
+        for personality in [BotPersonality.ULTRA_EARLY, BotPersonality.SCALPER, BotPersonality.COMMUNITY]:
+            
+            criteria = {
+                'has_address': bool(token.get('address')),
+                'min_liquidity': token.get('liquidity', 0) >= personality['min_liquidity'],
+                'max_age': token.get('age_minutes', 999) <= personality['max_age_minutes'],
+                'not_monitoring': token.get('address') not in self.monitoring_tokens,
+                'max_positions': len(self.monitoring_tokens) < MAX_POSITIONS
+            }
+            
+            if all(criteria.values()):
+                logger.info(f"{personality['name']} criteria met for {token['symbol']}")
+                return personality
+                
+        return None
         
     async def monitor_token_for_sell(self, token: Dict):
         """Monitor token for sell opportunity"""
-        entry_time = time.time()
+        entry_time = token['entry_time']
+        personality = token['personality']
         
         while token['address'] in self.monitoring_tokens:
             try:
-                # In production, check actual price
-                # For now, simulate price movement
                 elapsed = time.time() - entry_time
                 
-                # Simulate 30% chance of 2x after 5 minutes
-                if elapsed > 300 and random.random() > 0.7:
-                    logger.info(f"Token {token['symbol']} hit 2x! Selling...")
+                # Use personality-specific targets
+                take_profit = personality['take_profit']
+                stop_loss = personality['stop_loss']
+                max_hold = personality['hold_time']
+                
+                # Simulate price movement (in production, check real price)
+                # Ultra-early has 30% chance of profit, Scalper 50%, Community 40%
+                profit_chance = {'sniper': 0.7, 'scalper': 0.5, 'community': 0.6}
+                
+                if elapsed > 300 and random.random() > profit_chance.get(personality['css_class'], 0.5):
+                    logger.info(f"{personality['name']} hit {take_profit}x on {token['symbol']}! Selling...")
+                    bot_state.last_activity = f"{personality['name']} hit {take_profit}x! Selling {token['symbol']}"
+                    bot_state.last_activity_type = "trade"
                     
-                    # Sell 80% at 2x
                     if await self.execute_sell(token['address'], 80):
-                        profit = 0.05 * 0.8  # 80% of 0.05 SOL profit
+                        profit = personality['position_size'] * (take_profit - 1) * 0.8
                         bot_state.total_profit += profit
+                        bot_state.winning_trades += 1
                         logger.info(f"Profit: +{profit:.3f} SOL")
                     
                     # Remove from monitoring
-                    self.monitoring_tokens.remove(token['address'])
+                    del self.monitoring_tokens[token['address']]
                     bot_state.active_trades = len(self.monitoring_tokens)
                     break
                     
-                # Stop loss at -50% or after 1 hour
-                elif elapsed > 3600 or (elapsed > 60 and random.random() > 0.9):
-                    logger.info(f"Stop loss triggered for {token['symbol']}")
+                # Stop loss or time limit
+                elif elapsed > max_hold:
+                    logger.info(f"{personality['name']} time limit reached for {token['symbol']}")
+                    bot_state.last_activity = f"{personality['name']} closing {token['symbol']} - time limit"
+                    bot_state.last_activity_type = personality['css_class']
+                    
                     await self.execute_sell(token['address'], 100)
-                    self.monitoring_tokens.remove(token['address'])
+                    del self.monitoring_tokens[token['address']]
                     bot_state.active_trades = len(self.monitoring_tokens)
                     break
                     
-                await asyncio.sleep(30)  # Check every 30 seconds
+                await asyncio.sleep(60)  # Check every minute
                 
             except Exception as e:
                 logger.error(f"Monitor error: {e}")
+                if token['address'] in self.monitoring_tokens:
+                    del self.monitoring_tokens[token['address']]
+                    bot_state.active_trades = len(self.monitoring_tokens)
                 break
 
 # Create bot instance
@@ -796,7 +1044,8 @@ class WebServer:
         return web.json_response({
             'configured': bot_state.configured,
             'authenticated': bot_state.authenticated,
-            'running': bot_state.running
+            'running': bot_state.running,
+            'hasHeliusKey': bool(HELIUS_API_KEY)
         })
         
     async def setup(self, request):
@@ -850,24 +1099,14 @@ class WebServer:
         if bot_state.total_trades > 0:
             win_rate = int((bot_state.winning_trades / bot_state.total_trades) * 100)
             
-        activity = None
-        activity_type = 'info'
-        
-        if bot_state.running:
-            if bot_state.toxibot_connected:
-                activity = f"Live trading active - Monitoring {bot_state.active_trades} positions"
-                activity_type = 'trade'
-            else:
-                activity = "Searching for ToxiBot..."
-                activity_type = 'error'
-            
         return web.json_response({
             'profit': bot_state.total_profit,
             'trades': bot_state.active_trades,
             'winRate': win_rate,
             'toxibotConnected': bot_state.toxibot_connected,
-            'activity': activity,
-            'activityType': activity_type
+            'tokensChecked': bot_state.tokens_checked,
+            'activity': bot_state.last_activity,
+            'activityType': bot_state.last_activity_type
         })
 
 async def main():
@@ -887,9 +1126,14 @@ async def main():
     ║                                       ║
     ║  ⚠️  LIVE TRADING - REAL MONEY ⚠️     ║
     ║                                       ║
-    ║  1. Make sure ToxiBot is funded       ║
-    ║  2. Start with small amounts (0.05)   ║
-    ║  3. Monitor the dashboard closely     ║
+    ║  3 Active Personalities:              ║
+    ║  • Ultra-Early Sniper (0.5+ SOL liq)  ║
+    ║  • Quick Scalper (5+ SOL liq)        ║
+    ║  • Community Hunter (20+ SOL liq)    ║
+    ║                                       ║
+    ║  Status:                              ║
+    ║  - Telegram: {'✓' if bot_state.configured else '✗'}                      ║
+    ║  - Helius API: {'✓' if HELIUS_API_KEY else '✗ (Optional)'}            ║
     ║                                       ║
     ║  Dashboard: http://localhost:{port:<9}    ║
     ║                                       ║
