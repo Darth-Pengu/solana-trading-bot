@@ -1,0 +1,8 @@
+{
+  "name": "Solana Trading Bot",
+  "description": "Automated Solana trading bot with ToxiBot integration",
+  "deploy": {
+    "startCommand": "python main.py",
+    "restartPolicyType": "always"
+  }
+}
