@@ -1520,7 +1520,7 @@ async def start(self):
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
         
-        logger.info(f"""
+            logger.info(f"""
         ╔═══════════════════════════════════════════════╗
         ║           TRON TRADING SYSTEM                 ║
         ╠═══════════════════════════════════════════════╣
