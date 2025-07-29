@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SOLANA TRADING BOT - SIMPLIFIED VERSION
-Easy setup for non-coders
+SOLANA TRADING BOT - FIXED VERSION
+Corrected Telegram authentication
 """
 
 import asyncio
@@ -29,7 +29,7 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("Telegram not available - install telethon to enable trading")
 
-# HTML Dashboard
+# HTML Dashboard (same as before)
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html>
@@ -461,8 +461,6 @@ class BotState:
 
 # Global state
 bot_state = BotState()
-telegram_client = None
-toxibot_chat = None
 
 class SimpleTradingBot:
     """Simplified bot that connects to ToxiBot"""
@@ -471,6 +469,9 @@ class SimpleTradingBot:
         self.running = False
         self.api_id = None
         self.api_hash = None
+        self.client = None
+        self.phone = None
+        self.code_hash = None
         
     async def setup_telegram(self, api_id: str, api_hash: str):
         """Save Telegram credentials"""
@@ -478,48 +479,82 @@ class SimpleTradingBot:
         self.api_hash = api_hash
         bot_state.configured = True
         logger.info("Telegram credentials saved")
+        return True
         
     async def send_code(self, phone: str):
         """Send verification code"""
-        global telegram_client
-        
         if not TELEGRAM_AVAILABLE:
-            raise Exception("Telegram library not installed")
+            raise Exception("Telegram library not installed. Run: pip install telethon")
             
-        telegram_client = TelegramClient(StringSession(), int(self.api_id), self.api_hash)
-        await telegram_client.connect()
+        try:
+            # Create new client
+            self.client = TelegramClient(
+                StringSession(), 
+                int(self.api_id), 
+                self.api_hash
+            )
+            
+            # Connect
+            await self.client.connect()
+            
+            # Send code
+            self.phone = phone
+            result = await self.client.send_code_request(phone)
+            self.code_hash = result.phone_code_hash
+            
+            logger.info(f"Code sent to {phone}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to send code: {e}")
+            if self.client:
+                await self.client.disconnect()
+            raise
         
-        result = await telegram_client.send_code_request(phone)
-        logger.info(f"Code sent to {phone}")
-        return result.phone_code_hash
-        
-    async def verify_code(self, phone: str, code: str, code_hash: str):
+    async def verify_code(self, code: str):
         """Verify code and start bot"""
-        global telegram_client, toxibot_chat
-        
-        await telegram_client.sign_in(phone, code, phone_code_hash=code_hash)
-        
-        # Save session
-        session_string = telegram_client.session.save()
-        with open('session.txt', 'w') as f:
-            f.write(session_string)
+        if not self.client or not self.phone or not self.code_hash:
+            raise Exception("Must request code first")
             
-        bot_state.authenticated = True
-        
-        # Find ToxiBot
-        async for dialog in telegram_client.iter_dialogs():
-            if 'toxi' in dialog.name.lower():
-                toxibot_chat = dialog.entity
-                logger.info(f"Found ToxiBot: {dialog.name}")
-                break
+        try:
+            # Sign in
+            await self.client.sign_in(
+                self.phone, 
+                code, 
+                phone_code_hash=self.code_hash
+            )
+            
+            # Save session
+            session_string = self.client.session.save()
+            os.makedirs('data', exist_ok=True)
+            with open('data/session.txt', 'w') as f:
+                f.write(session_string)
                 
-        # Start trading
-        self.running = True
-        bot_state.running = True
-        asyncio.create_task(self.trading_loop())
-        
-        logger.info("Bot started successfully!")
-        
+            bot_state.authenticated = True
+            
+            # Find ToxiBot
+            toxibot_found = False
+            async for dialog in self.client.iter_dialogs():
+                if 'toxi' in dialog.name.lower():
+                    logger.info(f"Found ToxiBot: {dialog.name}")
+                    toxibot_found = True
+                    break
+                    
+            if not toxibot_found:
+                logger.warning("ToxiBot not found in chats. Make sure to start a chat with @toxi_solana_bot")
+                
+            # Start trading
+            self.running = True
+            bot_state.running = True
+            asyncio.create_task(self.trading_loop())
+            
+            logger.info("Bot started successfully!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Verification failed: {e}")
+            raise
+            
     async def trading_loop(self):
         """Simple trading loop"""
         while self.running:
@@ -538,7 +573,7 @@ class SimpleTradingBot:
                         bot_state.winning_trades += 1
                         profit = random.uniform(0.01, 0.05)
                         bot_state.total_profit += profit
-                        logger.info(f"Trade profit: +{profit:.3f} SOL")
+                        logger.info(f"Simulated trade profit: +{profit:.3f} SOL")
                         
             except Exception as e:
                 logger.error(f"Trading error: {e}")
@@ -546,10 +581,6 @@ class SimpleTradingBot:
 
 # Create bot instance
 trading_bot = SimpleTradingBot()
-
-# Store phone and code_hash temporarily
-temp_phone = None
-temp_code_hash = None
 
 class WebServer:
     """Simple web server"""
@@ -577,44 +608,49 @@ class WebServer:
         })
         
     async def setup(self, request):
-        global trading_bot
-        
         try:
             data = await request.json()
             api_id = data.get('api_id')
             api_hash = data.get('api_hash')
             
+            if not api_id or not api_hash:
+                return web.json_response({'error': 'Missing credentials'}, status=400)
+                
             await trading_bot.setup_telegram(api_id, api_hash)
             
             return web.json_response({'status': 'success'})
         except Exception as e:
+            logger.error(f"Setup error: {e}")
             return web.json_response({'error': str(e)}, status=400)
             
     async def request_code(self, request):
-        global temp_phone, temp_code_hash
-        
         try:
             data = await request.json()
             phone = data.get('phone')
-            temp_phone = phone
             
-            temp_code_hash = await trading_bot.send_code(phone)
+            if not phone:
+                return web.json_response({'error': 'Phone number required'}, status=400)
+                
+            await trading_bot.send_code(phone)
             
             return web.json_response({'status': 'success'})
         except Exception as e:
+            logger.error(f"Request code error: {e}")
             return web.json_response({'error': str(e)}, status=400)
             
     async def verify_code(self, request):
-        global temp_phone, temp_code_hash
-        
         try:
             data = await request.json()
             code = data.get('code')
             
-            await trading_bot.verify_code(temp_phone, code, temp_code_hash)
+            if not code:
+                return web.json_response({'error': 'Code required'}, status=400)
+                
+            await trading_bot.verify_code(code)
             
             return web.json_response({'status': 'success'})
         except Exception as e:
+            logger.error(f"Verify code error: {e}")
             return web.json_response({'error': str(e)}, status=400)
             
     async def stats(self, request):
@@ -624,7 +660,7 @@ class WebServer:
             
         activity = None
         if bot_state.running:
-            activity = f"Monitoring {bot_state.active_trades} positions"
+            activity = f"Bot active - Monitoring for opportunities"
             
         return web.json_response({
             'profit': bot_state.total_profit,
