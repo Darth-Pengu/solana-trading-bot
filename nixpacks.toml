@@ -1,0 +1,7 @@
+[phases.setup]
+nixpkgs = [
+  "openssl",
+  "libffi",
+  "python311Full",        # or your Python version
+  "python311Packages.pip" # if pip is missing
+]
