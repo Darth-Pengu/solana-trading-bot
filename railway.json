@@ -1,6 +1,22 @@
 {
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "nixpacksPlan": {
+      "providers": ["python"],
+      "phases": {
+        "setup": {
+          "nixPkgs": ["python311", "python311Packages.pip", "gcc", "openssl", "libffi", "zlib"]
+        },
+        "install": {
+          "dependsOn": ["setup"],
+          "cmds": [
+            "python -m ensurepip --upgrade",
+            "python -m pip install --upgrade pip setuptools wheel",
+            "python -m pip install --no-cache-dir -r requirements.txt"
+          ]
+        }
+      }
+    }
   },
   "deploy": {
     "startCommand": "python main.py",
