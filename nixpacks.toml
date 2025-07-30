@@ -5,4 +5,4 @@ nixPkgs = ["python311", "gcc", "openssl", "libffi", "zlib"]
 cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
 
 [start]
-cmd = "python fixed_main_py.py"
+cmd = "python main.py"
