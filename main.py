@@ -1298,52 +1298,71 @@ class TokenDiscovery:
             logger.error(f"Helius error: {e}")
             
     async def get_jupiter_new_tokens(self) -> List[Dict]:
-        """Get new tokens from Jupiter aggregator"""
+        """Get new tokens from Jupiter Price API V2"""
         try:
             session = await self.get_session()
             
-            # Jupiter's token list API
-            url = "https://token.jup.ag/all"
+            # Jupiter Price API v2 - Get tokens with prices
+            # First get all verified tokens
+            url = "https://api.jup.ag/price/v2/keys"
             
             async with session.get(url, timeout=10) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    tokens = []
+                    all_token_addresses = await response.json()
                     
-                    # Sort by timestamp if available, get newest
-                    # Jupiter doesn't provide age, so we'll check tokens not in our cache
-                    for token_data in data[:100]:  # Check first 100
-                        address = token_data.get('address', '')
-                        
-                        # Skip if we've seen it
-                        if address in self.checked_tokens:
-                            continue
+                    # Now get prices for newest tokens (check ones we haven't seen)
+                    new_addresses = []
+                    for address in all_token_addresses:
+                        if address not in self.checked_tokens and len(new_addresses) < 50:
+                            new_addresses.append(address)
+                    
+                    if not new_addresses:
+                        return []
+                    
+                    # Get token info and prices
+                    price_url = "https://api.jup.ag/price/v2"
+                    params = {
+                        "ids": ",".join(new_addresses[:30]),  # Limit to 30 tokens
+                        "showExtraInfo": "true"
+                    }
+                    
+                    async with session.get(price_url, params=params, timeout=10) as price_response:
+                        if price_response.status == 200:
+                            price_data = await price_response.json()
+                            tokens = []
                             
-                        # Basic validation
-                        if not address or len(address) < 32:
-                            continue
+                            for address, token_info in price_data.get('data', {}).items():
+                                # Skip if no price
+                                if not token_info.get('price'):
+                                    continue
+                                    
+                                # Calculate liquidity from extra info
+                                extra_info = token_info.get('extraInfo', {})
+                                volume_24h = extra_info.get('volume24hUSD', 0)
+                                
+                                # Skip very low volume tokens
+                                if volume_24h < 100:
+                                    continue
+                                
+                                token = {
+                                    'address': address,
+                                    'symbol': token_info.get('mintSymbol', 'UNKNOWN'),
+                                    'name': token_info.get('vsTokenSymbol', 'Unknown Token'),
+                                    'liquidity': volume_24h / 100,  # Rough estimate
+                                    'age_minutes': 60,  # Jupiter doesn't provide age
+                                    'volume_24h': volume_24h,
+                                    'price_usd': token_info.get('price', 0),
+                                    'holders': 0,  # Not provided
+                                    'source': 'jupiter'
+                                }
+                                
+                                tokens.append(token)
                             
-                        token = {
-                            'address': address,
-                            'symbol': token_data.get('symbol', 'UNKNOWN'),
-                            'name': token_data.get('name', ''),
-                            'liquidity': 10,  # Will verify with price check
-                            'age_minutes': 60,  # Estimate
-                            'volume_24h': 0,
-                            'holders': 0,
-                            'source': 'jupiter'
-                        }
-                        
-                        tokens.append(token)
-                        
-                        if len(tokens) >= 10:  # Limit to 10 new ones
-                            break
-                            
-                    logger.info(f"Found {len(tokens)} potential new tokens from Jupiter")
-                    return tokens
+                            logger.info(f"Found {len(tokens)} new tokens from Jupiter Price API")
+                            return tokens
                     
         except Exception as e:
-            logger.error(f"Jupiter error: {e}")
+            logger.error(f"Jupiter API error: {e}")
             
         return []
         
