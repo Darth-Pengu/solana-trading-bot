@@ -63,8 +63,9 @@ logging.basicConfig(
 logger = logging.getLogger('TradingBot')
 
 # Support alternative environment variable names
-TELEGRAM_API_ID = os.environ.get('TELEGRAM_API_ID', os.environ.get('TG_API_ID', '023200589'))
-TELEGRAM_API_HASH = os.environ.get('TELEGRAM_API_HASH', os.environ.get('TG_API_HASH', 'ece533b0e33fe29f8184af0322143869'))
+TELEGRAM_API_ID = os.environ.get('TELEGRAM_API_ID', os.environ.get('TG_API_ID', ''))
+TELEGRAM_API_HASH = os.environ.get('TELEGRAM_API_HASH', os.environ.get('TG_API_HASH', ''))
+
 # Try to import Telegram
 try:
     from telethon import TelegramClient, events
@@ -1928,6 +1929,60 @@ async def load_existing_session():
                     # Remove invalid session
                     os.remove(session_path)
         else:
+            logger.info("No existing session found - please use dashboard to authenticate")
+                    
+    except Exception as e:
+        logger.error(f"Failed to load session: {e}")
+        logger.info("Session error - please use dashboard to authenticate")
+        
+    return False
+            logger.info(f"Found session file at {session_path}")
+            with open(session_path, 'r') as f:
+                session_string = f.read().strip()
+                
+            if session_string and TELEGRAM_AVAILABLE:
+                logger.info("Attempting to load existing session...")
+                # Get API credentials from environment
+                api_id = TELEGRAM_API_ID or os.environ.get('TG_API_ID')
+                api_hash = TELEGRAM_API_HASH or os.environ.get('TG_API_HASH')
+                
+                if not api_id or not api_hash:
+                    logger.warning("No Telegram API credentials in environment")
+                    return False
+                
+                # Try to connect with existing session
+                client = TelegramClient(StringSession(session_string), 
+                                      int(api_id), 
+                                      api_hash)
+                                      
+                await client.connect()
+                
+                if await client.is_user_authorized():
+                    logger.info("Session loaded successfully!")
+                    trading_bot.client = client
+                    trading_bot.api_id = api_id
+                    trading_bot.api_hash = api_hash
+                    bot_state.configured = True
+                    bot_state.authenticated = True
+                    
+                    # Find ToxiBot and start
+                    await trading_bot.find_toxibot()
+                    trading_bot.running = True
+                    bot_state.running = True
+                    
+                    # Start all background tasks
+                    asyncio.create_task(trading_bot.trading_loop())
+                    asyncio.create_task(trading_bot.monitor_toxibot_messages())
+                    asyncio.create_task(trading_bot.monitor_positions())
+                    
+                    logger.info("Bot fully started with existing session!")
+                    return True
+                else:
+                    logger.warning("Session expired, need to re-authenticate")
+                    await client.disconnect()
+                    # Remove invalid session
+                    os.remove(session_path)
+        else:
             logger.info("No existing session found")
                     
     except Exception as e:
@@ -1945,10 +2000,14 @@ async def main():
     print(f"- HELIUS_API_KEY: {'Yes' if os.environ.get('HELIUS_API_KEY') else 'No'}")
     print(f"- PORT: {os.environ.get('PORT', 'Not set')}")
     
-    # Try to load existing session
-    await load_existing_session()
+    # Try to load existing session but don't fail if it doesn't exist
+    try:
+        await load_existing_session()
+    except Exception as e:
+        logger.info(f"No existing session: {e}")
+        logger.info("Starting web dashboard for authentication...")
     
-    # Start web server
+    # Start web server regardless of session status
     server = WebServer()
     
     port = int(os.environ.get('PORT', 8080))
@@ -1964,9 +2023,13 @@ async def main():
     ║                                       ║
     ║  Dashboard: http://localhost:{port}    ║
     ║                                       ║
+    ║  Status: {'Authenticated' if bot_state.authenticated else 'Need Authentication'}                  ║
+    ║                                       ║
     ╚═══════════════════════════════════════╝
     
     Bot is running on port {port}
+    
+    {'✓ Bot authenticated and trading!' if bot_state.authenticated else '→ Please visit the dashboard to authenticate with Telegram'}
     """)
     
     # Keep running
@@ -1979,6 +2042,3 @@ async def main():
         if trading_bot.client:
             await trading_bot.client.disconnect()
         await runner.cleanup()
-
-if __name__ == '__main__':
-    asyncio.run(main())
