@@ -717,7 +717,7 @@ class PriceChecker:
     def __init__(self):
         self.session = None
         self.price_cache = {}
-        self.cache_duration = 15  # Cache prices for 15 seconds (was 30)
+        self.cache_duration = 15  # Cache prices for 15 seconds
         
     async def get_session(self):
         if not self.session:
@@ -1440,7 +1440,8 @@ class TokenDiscovery:
                             data = await response.json()
                             
                             if data.get('success') and 'data' in data:
-                                for token_data in data['data'].get('tokens', [])[:20]:
+                                tokens_data = data.get('data', {}).get('tokens', [])
+                                for token_data in tokens_data[:20]:
                                     # Only include tokens with reasonable metrics
                                     if token_data.get('v24hUSD', 0) > 100:  # Min $100 daily volume
                                         token = {
@@ -1455,7 +1456,7 @@ class TokenDiscovery:
                                             'source': 'birdeye'
                                         }
                                         
-                                        if token['address']:
+                                        if token.get('address'):
                                             all_tokens.append(token)
                 except:
                     continue
