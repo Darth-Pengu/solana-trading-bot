@@ -4,6 +4,12 @@ SOLANA TRADING BOT - FIXED VERSION WITH SAFETY MEASURES
 Includes real price checking, risk management, and proper error handling
 """
 
+import os
+# Disable cryptg to avoid SSL issues
+os.environ['TELETHON_USE_CRYPTG'] = '0'
+
+# Continue with rest of imports...#!/usr/bin/env python3
+
 import asyncio
 import os
 import json
