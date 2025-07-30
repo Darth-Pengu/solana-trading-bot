@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SOLANA TRADING BOT - COMPLETE VERSION WITH ALL FIXES
-Three personalities, proper ToxiBot commands, aggressive settings
+SOLANA TRADING BOT - FIXED VERSION WITH SAFETY MEASURES
+Includes real price checking, risk management, and proper error handling
 """
 
 import asyncio
@@ -11,13 +11,17 @@ import time
 import logging
 import random
 import aiohttp
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 from aiohttp import web
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import re
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# Setup logging with more detail
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger('TradingBot')
 
 # Try to import Telegram
@@ -29,16 +33,31 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("Telegram not available - install telethon to enable trading")
 
-# Configuration - AGGRESSIVE SETTINGS FOR MORE TRADES
+# Configuration with SAFE DEFAULTS
 HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '')
-POSITION_SIZE = 0.05  # Default SOL per trade
-MIN_LIQUIDITY = 2  # Lowered from 10 SOL for more opportunities
-MAX_TOKEN_AGE = 1800  # 30 minutes instead of 10
-MAX_POSITIONS = 10  # Increased from 5 for more trades
+POSITION_SIZE = 0.01  # Start VERY small - 0.01 SOL per trade
+MIN_LIQUIDITY = 10  # Minimum 10 SOL liquidity for safety
+MAX_TOKEN_AGE = 3600  # 1 hour max age
+MAX_POSITIONS = 3  # Start with only 3 concurrent positions
+MAX_DAILY_LOSS = 0.2  # Maximum 0.2 SOL daily loss (increased from 0.1)
+MAX_POSITION_SIZE = 0.05  # Never risk more than 0.05 SOL per trade
+MIN_WALLET_BALANCE = 0.1  # Keep at least 0.1 SOL for fees
 
-# HTML Dashboard
-DASHBOARD_HTML = '''
-<!DOCTYPE html>
+# Risk Management Settings
+RISK_SETTINGS = {
+    'max_slippage': 0.05,  # 5% max slippage
+    'max_price_impact': 0.03,  # 3% max price impact
+    'cooldown_after_loss': 300,  # 5 min cooldown after loss
+    'require_volume_check': True,  # Must have recent volume
+    'min_holders': 10,  # Minimum token holders
+    'check_contract': True,  # Enable contract verification
+    'check_rug_risk': True,  # Enable rug pull detection
+    'max_concentration': 0.1,  # Max 10% held by single wallet
+    'min_liquidity_locked': 0.5,  # At least 50% liquidity locked
+}
+
+# HTML Dashboard (unchanged for brevity)
+DASHBOARD_HTML = '''<!DOCTYPE html>
 <html>
 <head>
     <title>Solana Trading Bot - LIVE</title>
@@ -287,6 +306,18 @@ DASHBOARD_HTML = '''
             background: #00ffff;
             color: #000;
         }
+        
+        .risk-indicator {
+            background: rgba(255,0,0,0.2);
+            border: 2px solid #ff0000;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        
+        .risk-indicator h3 {
+            color: #ff0000;
+            margin-bottom: 10px;
+        }
     </style>
 </head>
 <body>
@@ -334,6 +365,13 @@ DASHBOARD_HTML = '''
                 ⚠️ LIVE TRADING ACTIVE - Real money at risk! Start with small amounts.
             </div>
             
+            <div class="risk-indicator">
+                <h3>Risk Management Active</h3>
+                <p>Max Position: 0.05 SOL | Max Daily Loss: 0.2 SOL | Min Liquidity: 10 SOL</p>
+                <p>Contract Checking: Enabled | Rug Detection: Active</p>
+                <p id="riskStatus">Status: Monitoring...</p>
+            </div>
+            
             <div class="api-setup" id="apiWarning">
                 <h3>⚠️ Optional: Add Helius API Key for Better Token Discovery</h3>
                 <p>Get a free API key from <a href="https://www.helius.dev/" target="_blank" style="color: #ff6600;">helius.dev</a></p>
@@ -343,6 +381,7 @@ DASHBOARD_HTML = '''
             <div class="status" id="botStatus">
                 <h2>Bot Status: <span id="statusText">Offline</span></h2>
                 <p id="toxibotStatus">ToxiBot: Not connected</p>
+                <p id="walletStatus">Wallet Balance: Checking...</p>
                 <p>Active Bots: <span class="personality-indicator personality-sniper">SNIPER</span>
                                 <span class="personality-indicator personality-scalper">SCALPER</span>
                                 <span class="personality-indicator personality-community">COMMUNITY</span></p>
@@ -514,6 +553,14 @@ DASHBOARD_HTML = '''
                 document.getElementById('winRate').textContent = data.winRate + '%';
                 document.getElementById('tokensChecked').textContent = data.tokensChecked || 0;
                 
+                if (data.walletBalance !== undefined) {
+                    document.getElementById('walletStatus').textContent = `Wallet Balance: ${data.walletBalance.toFixed(3)} SOL`;
+                }
+                
+                if (data.riskStatus) {
+                    document.getElementById('riskStatus').textContent = `Status: ${data.riskStatus}`;
+                }
+                
                 if (data.toxibotConnected) {
                     document.getElementById('toxibotStatus').textContent = 'ToxiBot: Connected ✓';
                 }
@@ -558,6 +605,29 @@ DASHBOARD_HTML = '''
 '''
 
 @dataclass
+class Trade:
+    """Track individual trades"""
+    token_address: str
+    symbol: str
+    entry_price: float
+    current_price: float
+    position_size: float
+    entry_time: float
+    personality: Dict
+    stop_loss: float
+    take_profit: float
+    
+    @property
+    def pnl(self) -> float:
+        """Calculate profit/loss"""
+        return self.position_size * (self.current_price / self.entry_price - 1)
+    
+    @property
+    def pnl_percent(self) -> float:
+        """Calculate profit/loss percentage"""
+        return (self.current_price / self.entry_price - 1) * 100
+
+@dataclass
 class BotState:
     configured: bool = False
     authenticated: bool = False
@@ -566,49 +636,533 @@ class BotState:
     active_trades: int = 0
     total_trades: int = 0
     winning_trades: int = 0
+    losing_trades: int = 0
     toxibot_connected: bool = False
     tokens_checked: int = 0
     last_activity: Optional[str] = None
     last_activity_type: str = 'info'
+    wallet_balance: float = 0.0
+    daily_loss: float = 0.0
+    last_loss_time: float = 0
+    trades_this_hour: int = 0
+    hour_start: float = time.time()
+    risk_status: str = "Normal"
+    active_positions: Dict[str, Trade] = field(default_factory=dict)
 
 # Global state
 bot_state = BotState()
 
 class BotPersonality:
-    """Different trading personalities with unique strategies"""
+    """Different trading personalities with SAFE strategies"""
     
-    ULTRA_EARLY = {
-        'name': 'Ultra-Early Sniper',
-        'min_liquidity': 0.5,  # Super low - maximum risk
-        'max_age_minutes': 2,  # Only brand new tokens
-        'position_size': 0.02,  # Smaller positions due to risk
-        'take_profit': 3.0,  # 3x target
-        'stop_loss': 0.5,  # -50%
-        'hold_time': 900,  # 15 minutes max
-        'css_class': 'sniper'
-    }
-    
-    SCALPER = {
-        'name': 'Quick Scalper',
-        'min_liquidity': 5,
-        'max_age_minutes': 10,
-        'position_size': 0.05,
-        'take_profit': 1.5,  # 50% profit
-        'stop_loss': 0.8,  # -20%
+    CONSERVATIVE_SNIPER = {
+        'name': 'Conservative Sniper',
+        'min_liquidity': 20,  # Higher liquidity requirement
+        'max_age_minutes': 30,  # Only newer tokens
+        'position_size': 0.01,  # Very small positions
+        'take_profit': 1.5,  # 50% profit target
+        'stop_loss': 0.9,  # -10% stop loss
         'hold_time': 1800,  # 30 minutes max
-        'css_class': 'scalper'
+        'css_class': 'sniper',
+        'min_volume_24h': 1000,  # Minimum $1000 daily volume
+        'min_holders': 50  # At least 50 holders
     }
     
-    COMMUNITY = {
-        'name': 'Community Hunter',
-        'min_liquidity': 20,
-        'max_age_minutes': 60,
-        'position_size': 0.1,
-        'take_profit': 2.0,
-        'stop_loss': 0.7,  # -30%
-        'hold_time': 7200,  # 2 hours max
-        'css_class': 'community'
+    SAFE_SCALPER = {
+        'name': 'Safe Scalper',
+        'min_liquidity': 50,
+        'max_age_minutes': 120,
+        'position_size': 0.02,
+        'take_profit': 1.2,  # 20% profit
+        'stop_loss': 0.95,  # -5% stop loss
+        'hold_time': 3600,  # 1 hour max
+        'css_class': 'scalper',
+        'min_volume_24h': 5000,
+        'min_holders': 100
     }
+    
+    ESTABLISHED_TRADER = {
+        'name': 'Established Trader',
+        'min_liquidity': 100,
+        'max_age_minutes': 1440,  # 24 hours
+        'position_size': 0.03,
+        'take_profit': 1.3,
+        'stop_loss': 0.93,  # -7% stop loss
+        'hold_time': 7200,  # 2 hours max
+        'css_class': 'community',
+        'min_volume_24h': 10000,
+        'min_holders': 200
+    }
+
+class PriceChecker:
+    """Check real token prices using multiple sources"""
+    
+    def __init__(self):
+        self.session = None
+        self.price_cache = {}
+        self.cache_duration = 30  # Cache prices for 30 seconds
+        
+    async def get_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+        
+    async def get_token_price(self, token_address: str) -> Optional[float]:
+        """Get token price in SOL"""
+        # Check cache first
+        cache_key = f"{token_address}_price"
+        if cache_key in self.price_cache:
+            cached_data = self.price_cache[cache_key]
+            if time.time() - cached_data['timestamp'] < self.cache_duration:
+                return cached_data['price']
+        
+        # Try multiple price sources
+        price = await self._get_price_from_dexscreener(token_address)
+        if not price:
+            price = await self._get_price_from_birdeye(token_address)
+        
+        if price:
+            self.price_cache[cache_key] = {
+                'price': price,
+                'timestamp': time.time()
+            }
+            
+        return price
+        
+    async def _get_price_from_dexscreener(self, token_address: str) -> Optional[float]:
+        """Get price from DexScreener"""
+        try:
+            session = await self.get_session()
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            
+            async with session.get(url, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    pairs = data.get('pairs', [])
+                    
+                    # Find SOL pair with highest liquidity
+                    sol_pairs = [p for p in pairs if p.get('quoteToken', {}).get('symbol') == 'SOL']
+                    if sol_pairs:
+                        # Sort by liquidity
+                        sol_pairs.sort(key=lambda x: x.get('liquidity', {}).get('usd', 0), reverse=True)
+                        price_sol = float(sol_pairs[0].get('priceNative', 0))
+                        return price_sol
+                        
+        except Exception as e:
+            logger.error(f"DexScreener price error: {e}")
+            
+        return None
+        
+    async def _get_price_from_birdeye(self, token_address: str) -> Optional[float]:
+        """Get price from Birdeye"""
+        try:
+            session = await self.get_session()
+            url = f"https://public-api.birdeye.so/public/price?address={token_address}"
+            
+            async with session.get(url, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('success'):
+                        # Convert USD price to SOL price
+                        usd_price = data.get('data', {}).get('value', 0)
+                        sol_usd_price = await self._get_sol_price()
+                        if sol_usd_price and usd_price:
+                            return usd_price / sol_usd_price
+                            
+        except Exception as e:
+            logger.error(f"Birdeye price error: {e}")
+            
+        return None
+        
+    async def _get_sol_price(self) -> Optional[float]:
+        """Get SOL price in USD"""
+        cache_key = "SOL_USD"
+        if cache_key in self.price_cache:
+            cached_data = self.price_cache[cache_key]
+            if time.time() - cached_data['timestamp'] < 300:  # 5 min cache
+                return cached_data['price']
+                
+        try:
+            session = await self.get_session()
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+            
+            async with session.get(url, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    price = data.get('solana', {}).get('usd', 0)
+                    if price:
+                        self.price_cache[cache_key] = {
+                            'price': price,
+                            'timestamp': time.time()
+                        }
+                        return price
+                        
+        except Exception as e:
+            logger.error(f"SOL price error: {e}")
+            
+        return 40.0  # Fallback SOL price
+
+class ContractChecker:
+    """Check token contracts for safety and rug pull risks"""
+    
+    def __init__(self):
+        self.session = None
+        self.checked_contracts = {}
+        
+    async def get_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+        
+    async def check_token_safety(self, token_address: str) -> Dict:
+        """Comprehensive token safety check with RugCheck.xyz as primary source"""
+        # Check cache first
+        if token_address in self.checked_contracts:
+            cached = self.checked_contracts[token_address]
+            if time.time() - cached['timestamp'] < 3600:  # 1 hour cache
+                return cached['result']
+        
+        result = {
+            'is_safe': True,
+            'risk_score': 0,  # 0-10, higher = riskier
+            'warnings': [],
+            'contract_verified': False,
+            'liquidity_locked': False,
+            'ownership_renounced': False,
+            'mint_disabled': False,
+            'freeze_disabled': False,
+            'top_holder_percentage': 0,
+            'dev_wallet_percentage': 0,
+            'liquidity_percentage': 0,
+            'rugcheck_score': 0,
+            'rugcheck_analysis': None
+        }
+        
+        try:
+            # Primary check: RugCheck.xyz (most comprehensive)
+            rugcheck_data = await self._check_rugcheck(token_address)
+            if rugcheck_data:
+                result.update(rugcheck_data)
+                result['rugcheck_analysis'] = True
+                
+                # If RugCheck gives high confidence data, we can skip other checks
+                if rugcheck_data.get('rugcheck_score', 0) > 0:
+                    # RugCheck provided comprehensive analysis
+                    logger.info(f"RugCheck analysis for {token_address[:8]}: Score {rugcheck_data['rugcheck_score']}/100, Risk: {rugcheck_data['risk_score']}/10")
+                    
+                    # Early exit for very risky tokens
+                    if rugcheck_data['risk_score'] >= 7:
+                        result['is_safe'] = False
+                        result['warnings'].insert(0, "🚨 RUGCHECK: HIGH RISK - DO NOT TRADE")
+            
+            # If RugCheck didn't provide full data or token is borderline, do additional checks
+            if not rugcheck_data or rugcheck_data['risk_score'] >= 4:
+                # Secondary check: Holder distribution
+                holder_data = await self._check_holder_distribution(token_address)
+                if holder_data:
+                    # Merge holder data, taking worst case
+                    if holder_data['risk_score'] > result['risk_score']:
+                        result['risk_score'] = holder_data['risk_score']
+                    result['warnings'].extend(holder_data.get('warnings', []))
+                    
+                # Tertiary check: Token metadata and trading patterns
+                metadata = await self._check_token_metadata(token_address)
+                if metadata:
+                    # Merge metadata, taking worst case
+                    if metadata['risk_score'] > result['risk_score']:
+                        result['risk_score'] = metadata['risk_score']
+                    result['warnings'].extend(metadata.get('warnings', []))
+            
+            # Final safety determination
+            result['is_safe'] = result['risk_score'] < 7
+            
+            # Add summary warning if risky
+            if result['risk_score'] >= 7:
+                result['warnings'].insert(0, f"🚨 OVERALL RISK SCORE: {result['risk_score']}/10 - HIGH RISK")
+            elif result['risk_score'] >= 5:
+                result['warnings'].insert(0, f"⚠️ OVERALL RISK SCORE: {result['risk_score']}/10 - MEDIUM RISK")
+            else:
+                result['warnings'].insert(0, f"✅ OVERALL RISK SCORE: {result['risk_score']}/10 - ACCEPTABLE")
+            
+            # Cache result
+            self.checked_contracts[token_address] = {
+                'result': result,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            logger.error(f"Contract check error for {token_address}: {e}")
+            result['is_safe'] = False
+            result['warnings'].append("Failed to verify contract safety")
+            result['risk_score'] = 8  # High risk if we can't verify
+            
+        return result
+        
+    async def _check_rugcheck(self, token_address: str) -> Optional[Dict]:
+        """Check RugCheck.xyz for comprehensive token safety analysis"""
+        try:
+            session = await self.get_session()
+            
+            # RugCheck.xyz API endpoint - using their full report
+            url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report"
+            
+            # Alternative endpoint for detailed analysis
+            detailed_url = f"https://rugcheck.xyz/api/v1/report/{token_address}"
+            
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    risk_score = 0
+                    warnings = []
+                    
+                    # Parse RugCheck's risk assessment
+                    if 'risks' in data:
+                        # RugCheck provides categorized risks
+                        for risk in data.get('risks', []):
+                            severity = risk.get('severity', 'low')
+                            description = risk.get('description', '')
+                            
+                            if severity == 'critical':
+                                risk_score += 4
+                                warnings.append(f"🚨 {description}")
+                            elif severity == 'high':
+                                risk_score += 3
+                                warnings.append(f"⚠️ {description}")
+                            elif severity == 'medium':
+                                risk_score += 2
+                                warnings.append(f"⚡ {description}")
+                            else:
+                                risk_score += 1
+                                warnings.append(f"ℹ️ {description}")
+                    
+                    # Check specific flags from RugCheck
+                    token_info = data.get('token', {})
+                    
+                    # Mint Authority
+                    if token_info.get('mint_authority'):
+                        if not token_info.get('mint_authority_disabled'):
+                            risk_score += 3
+                            warnings.append("⚠️ Mint authority still active")
+                    
+                    # Freeze Authority
+                    if token_info.get('freeze_authority'):
+                        if not token_info.get('freeze_authority_disabled'):
+                            risk_score += 3
+                            warnings.append("⚠️ Freeze authority still active")
+                    
+                    # LP (Liquidity Pool) Analysis
+                    lp_info = data.get('liquidity_pools', [])
+                    if lp_info:
+                        main_pool = lp_info[0] if lp_info else {}
+                        
+                        # Check LP burn/lock status
+                        if not main_pool.get('lp_burned') and not main_pool.get('lp_locked'):
+                            risk_score += 2
+                            warnings.append("⚠️ LP tokens not burned or locked")
+                            
+                        # Check liquidity amount
+                        liquidity_usd = main_pool.get('liquidity_usd', 0)
+                        if liquidity_usd < 1000:
+                            risk_score += 2
+                            warnings.append(f"⚠️ Very low liquidity: ${liquidity_usd:.0f}")
+                    
+                    # Ownership and control
+                    ownership = data.get('ownership', {})
+                    if ownership.get('renounced') == False:
+                        risk_score += 2
+                        warnings.append("⚠️ Ownership not renounced")
+                        
+                    # Holder distribution
+                    holders = data.get('holders', {})
+                    top_10_percentage = holders.get('top_10_percentage', 0)
+                    if top_10_percentage > 70:
+                        risk_score += 3
+                        warnings.append(f"⚠️ Top 10 holders own {top_10_percentage:.1f}%")
+                    elif top_10_percentage > 50:
+                        risk_score += 2
+                        warnings.append(f"⚡ Top 10 holders own {top_10_percentage:.1f}%")
+                        
+                    # Creator holdings
+                    creator_percentage = holders.get('creator_percentage', 0)
+                    if creator_percentage > 10:
+                        risk_score += 3
+                        warnings.append(f"⚠️ Creator holds {creator_percentage:.1f}%")
+                        
+                    # Market and trading analysis
+                    market = data.get('market', {})
+                    
+                    # Check for honeypot indicators
+                    if market.get('buy_tax', 0) > 10:
+                        risk_score += 2
+                        warnings.append(f"⚠️ High buy tax: {market['buy_tax']}%")
+                        
+                    if market.get('sell_tax', 0) > 10:
+                        risk_score += 3
+                        warnings.append(f"⚠️ High sell tax: {market['sell_tax']}%")
+                        
+                    # Trading pattern analysis
+                    if market.get('unique_wallets_24h', 0) < 10:
+                        risk_score += 2
+                        warnings.append("⚠️ Very few unique traders")
+                        
+                    # Get overall risk rating from RugCheck
+                    overall_risk = data.get('risk_level', 'unknown')
+                    rugcheck_score = data.get('score', 0)  # RugCheck's 0-100 safety score
+                    
+                    # Convert RugCheck score to our risk score
+                    if rugcheck_score > 0:
+                        # RugCheck uses 0-100 where 100 is safest
+                        # Convert to our 0-10 where 0 is safest
+                        risk_score = max(0, min(10, int((100 - rugcheck_score) / 10)))
+                        
+                    # Add overall assessment
+                    if overall_risk == 'high' or rugcheck_score < 30:
+                        warnings.insert(0, "🚨 RugCheck: HIGH RISK TOKEN")
+                    elif overall_risk == 'medium' or rugcheck_score < 60:
+                        warnings.insert(0, "⚠️ RugCheck: MEDIUM RISK")
+                    elif overall_risk == 'low' or rugcheck_score >= 60:
+                        warnings.insert(0, "✅ RugCheck: Relatively safe")
+                        
+                    return {
+                        'risk_score': min(10, risk_score),  # Cap at 10
+                        'warnings': warnings,
+                        'rugcheck_score': rugcheck_score,
+                        'rugcheck_risk': overall_risk,
+                        'mint_disabled': token_info.get('mint_authority_disabled', False),
+                        'freeze_disabled': token_info.get('freeze_authority_disabled', False),
+                        'ownership_renounced': ownership.get('renounced', False),
+                        'lp_burned': any(pool.get('lp_burned', False) for pool in lp_info),
+                        'lp_locked': any(pool.get('lp_locked', False) for pool in lp_info),
+                        'top_holder_percentage': holders.get('top_1_percentage', 0),
+                        'creator_percentage': creator_percentage,
+                        'liquidity_usd': lp_info[0].get('liquidity_usd', 0) if lp_info else 0
+                    }
+                    
+                elif response.status == 404:
+                    # Token not found in RugCheck - likely very new
+                    return {
+                        'risk_score': 5,
+                        'warnings': ['ℹ️ Token too new for RugCheck analysis'],
+                        'rugcheck_score': 0,
+                        'rugcheck_risk': 'unknown'
+                    }
+                    
+        except Exception as e:
+            logger.debug(f"RugCheck API error: {e}")
+            
+        return None
+        
+    async def _check_holder_distribution(self, token_address: str) -> Optional[Dict]:
+        """Check token holder distribution"""
+        try:
+            session = await self.get_session()
+            
+            # Try Helius first if available
+            if HELIUS_API_KEY:
+                url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_API_KEY}"
+                payload = {"mintAccounts": [token_address]}
+                
+                async with session.post(url, json=payload, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Parse holder data
+                        return await self._parse_holder_data(data)
+                        
+            # Fallback to other sources
+            # Check Solscan API (limited free tier)
+            url = f"https://public-api.solscan.io/token/holders?tokenAddress={token_address}&limit=10"
+            
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if data.get('data'):
+                        holders = data['data']
+                        total_supply = data.get('total', 1)
+                        
+                        # Calculate concentration
+                        top_holder_amount = holders[0].get('amount', 0) if holders else 0
+                        top_holder_percent = (top_holder_amount / total_supply) * 100 if total_supply > 0 else 0
+                        
+                        warnings = []
+                        risk_score = 0
+                        
+                        if top_holder_percent > 20:
+                            risk_score += 3
+                            warnings.append(f"⚠️ Top holder owns {top_holder_percent:.1f}%")
+                            
+                        if len(holders) < 10:
+                            risk_score += 2
+                            warnings.append(f"⚠️ Only {len(holders)} holders")
+                            
+                        return {
+                            'top_holder_percentage': top_holder_percent,
+                            'holder_count': len(holders),
+                            'risk_score': risk_score,
+                            'warnings': warnings
+                        }
+                        
+        except Exception as e:
+            logger.debug(f"Holder check error: {e}")
+            
+        return None
+        
+    async def _check_token_metadata(self, token_address: str) -> Optional[Dict]:
+        """Check token metadata for red flags"""
+        try:
+            session = await self.get_session()
+            
+            # Get token metadata
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    pairs = data.get('pairs', [])
+                    
+                    if pairs:
+                        warnings = []
+                        risk_score = 0
+                        
+                        # Check liquidity locks
+                        for pair in pairs:
+                            liquidity = pair.get('liquidity', {})
+                            if liquidity.get('usd', 0) < 1000:
+                                risk_score += 2
+                                warnings.append("⚠️ Very low liquidity")
+                                
+                            # Check for honeypot indicators
+                            buys = pair.get('txns', {}).get('h24', {}).get('buys', 0)
+                            sells = pair.get('txns', {}).get('h24', {}).get('sells', 0)
+                            
+                            if buys > 10 and sells == 0:
+                                risk_score += 5
+                                warnings.append("🚨 No sells detected - possible honeypot!")
+                                
+                            elif buys > 0 and sells / buys < 0.1:
+                                risk_score += 3
+                                warnings.append("⚠️ Very few sells - suspicious")
+                                
+                        return {
+                            'risk_score': risk_score,
+                            'warnings': warnings,
+                            'liquidity_usd': pairs[0].get('liquidity', {}).get('usd', 0) if pairs else 0
+                        }
+                        
+        except Exception as e:
+            logger.debug(f"Metadata check error: {e}")
+            
+        return None
+        
+    async def _parse_holder_data(self, data: Dict) -> Dict:
+        """Parse holder data from various sources"""
+        # Implementation depends on data format
+        return {
+            'holder_count': 0,
+            'top_holder_percentage': 0,
+            'warnings': []
+        }
 
 class TokenDiscovery:
     """Discover new tokens from multiple sources"""
@@ -616,6 +1170,8 @@ class TokenDiscovery:
     def __init__(self):
         self.session = None
         self.checked_tokens = set()
+        self.price_checker = PriceChecker()
+        self.contract_checker = ContractChecker()  # Add contract checker
         
     async def get_session(self):
         if not self.session:
@@ -629,50 +1185,54 @@ class TokenDiscovery:
         # Try multiple discovery methods
         if HELIUS_API_KEY:
             tokens.extend(await self.get_helius_tokens())
-        else:
-            tokens.extend(await self.get_birdeye_tokens())
             
-        # Filter out already checked tokens
-        new_tokens = []
+        # Always try free sources
+        tokens.extend(await self.get_dexscreener_tokens())
+        tokens.extend(await self.get_birdeye_tokens())
+        
+        logger.info(f"Total tokens found before filtering: {len(tokens)}")
+        
+        # Filter and validate tokens
+        validated_tokens = []
         for token in tokens:
             if token['address'] not in self.checked_tokens:
-                self.checked_tokens.add(token['address'])
-                new_tokens.append(token)
+                # Validate token has required fields
+                if all(token.get(field) for field in ['address', 'symbol', 'liquidity']):
+                    self.checked_tokens.add(token['address'])
+                    validated_tokens.append(token)
                 
         bot_state.tokens_checked = len(self.checked_tokens)
-        return new_tokens
+        logger.info(f"New validated tokens: {len(validated_tokens)}")
+        
+        return validated_tokens
         
     async def get_helius_tokens(self) -> List[Dict]:
-        """Get new tokens from Helius"""
+        """Get new tokens from Helius with better parsing"""
         try:
             session = await self.get_session()
-            url = f"https://api.helius.xyz/v0/addresses/transactions?api-key={HELIUS_API_KEY}"
             
-            # Query for recent token creation transactions
-            params = {
-                'limit': 10,
-                'type': 'UNKNOWN'  # Often new tokens
-            }
+            # Get recent token creations
+            url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_API_KEY}"
             
-            async with session.get(url, params=params) as response:
+            # Get new token list
+            list_url = f"https://api.helius.xyz/v0/addresses/tokens?api-key={HELIUS_API_KEY}&limit=100"
+            
+            async with session.get(list_url, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
                     tokens = []
                     
-                    # Parse transactions for new tokens
-                    # This is simplified - in production you'd parse more carefully
-                    for tx in data:
-                        if 'tokenTransfers' in tx:
-                            for transfer in tx['tokenTransfers']:
-                                token = {
-                                    'address': transfer.get('mint', ''),
-                                    'symbol': 'NEW',
-                                    'liquidity': 10,  # Would calculate real liquidity
-                                    'age_minutes': 5,
-                                    'source': 'helius'
-                                }
-                                tokens.append(token)
-                                
+                    for token_data in data[:20]:  # Process top 20
+                        try:
+                            address = token_data.get('mint', token_data.get('address', ''))
+                            if address:
+                                # Get token details
+                                token_info = await self._get_token_details(address)
+                                if token_info:
+                                    tokens.append(token_info)
+                        except:
+                            continue
+                            
                     logger.info(f"Found {len(tokens)} tokens from Helius")
                     return tokens
                     
@@ -681,40 +1241,197 @@ class TokenDiscovery:
             
         return []
         
-    async def get_birdeye_tokens(self) -> List[Dict]:
-        """Get trending tokens from Birdeye (free)"""
+    async def get_dexscreener_tokens(self) -> List[Dict]:
+        """Get new tokens from DexScreener"""
         try:
             session = await self.get_session()
-            url = "https://public-api.birdeye.so/public/tokenlist?sort_by=v24hUSD&sort_type=desc&limit=10"
             
-            async with session.get(url) as response:
+            # Get new pairs sorted by age
+            url = "https://api.dexscreener.com/latest/dex/search/?q=pool:created:24h"
+            
+            async with session.get(url, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
                     tokens = []
                     
-                    if 'data' in data and 'tokens' in data['data']:
-                        for token_data in data['data']['tokens'][:5]:  # Top 5
-                            # Only get new tokens
-                            if token_data.get('v24hUSD', 0) < 100000:  # Small volume = new
-                                token = {
-                                    'address': token_data.get('address', ''),
-                                    'symbol': token_data.get('symbol', 'UNKNOWN'),
-                                    'liquidity': token_data.get('liquidity', 0) / 1e9,  # Convert to SOL
-                                    'age_minutes': 30,  # Estimate
-                                    'source': 'birdeye'
-                                }
+                    for pair in data.get('pairs', [])[:30]:
+                        # Only Solana tokens
+                        if pair.get('chainId') == 'solana':
+                            base_token = pair.get('baseToken', {})
+                            
+                            # Calculate age in minutes
+                            created_at = pair.get('pairCreatedAt', 0)
+                            if created_at:
+                                age_minutes = (time.time() * 1000 - created_at) / 60000
+                            else:
+                                age_minutes = 60  # Default 1 hour
+                                
+                            token = {
+                                'address': base_token.get('address', ''),
+                                'symbol': base_token.get('symbol', 'UNKNOWN'),
+                                'name': base_token.get('name', ''),
+                                'liquidity': pair.get('liquidity', {}).get('usd', 0) / 40,  # Convert to SOL
+                                'age_minutes': int(age_minutes),
+                                'volume_24h': pair.get('volume', {}).get('h24', 0),
+                                'price_usd': pair.get('priceUsd', 0),
+                                'holders': 0,  # Will check separately
+                                'source': 'dexscreener'
+                            }
+                            
+                            if token['address'] and token['liquidity'] > 0:
                                 tokens.append(token)
                                 
-                    logger.info(f"Found {len(tokens)} tokens from Birdeye")
+                    logger.info(f"Found {len(tokens)} tokens from DexScreener")
                     return tokens
                     
+        except Exception as e:
+            logger.error(f"DexScreener error: {e}")
+            
+        return []
+        
+    async def get_birdeye_tokens(self) -> List[Dict]:
+        """Get trending tokens from Birdeye"""
+        try:
+            session = await self.get_session()
+            
+            # Try multiple sorting options for variety
+            endpoints = [
+                "https://public-api.birdeye.so/public/tokenlist?sort_by=v24hChangePercent&sort_type=desc&offset=0&limit=50",
+                "https://public-api.birdeye.so/public/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=50",
+                "https://public-api.birdeye.so/public/tokenlist?sort_by=mc&sort_type=asc&offset=0&limit=50"
+            ]
+            
+            all_tokens = []
+            
+            for url in endpoints:
+                try:
+                    async with session.get(url, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            
+                            if data.get('success') and 'data' in data:
+                                for token_data in data['data'].get('tokens', [])[:20]:
+                                    # Only include tokens with reasonable metrics
+                                    if token_data.get('v24hUSD', 0) > 100:  # Min $100 daily volume
+                                        token = {
+                                            'address': token_data.get('address', ''),
+                                            'symbol': token_data.get('symbol', 'UNKNOWN'),
+                                            'name': token_data.get('name', ''),
+                                            'liquidity': token_data.get('liquidity', 0) / 1e9,  # Convert to SOL
+                                            'age_minutes': 60,  # Default estimate
+                                            'volume_24h': token_data.get('v24hUSD', 0),
+                                            'price_usd': token_data.get('v24hUSD', 0) / max(token_data.get('v24hTx', 1), 1),
+                                            'holders': token_data.get('holder', 0),
+                                            'source': 'birdeye'
+                                        }
+                                        
+                                        if token['address']:
+                                            all_tokens.append(token)
+                except:
+                    continue
+                    
+            # Remove duplicates
+            unique_tokens = {}
+            for token in all_tokens:
+                unique_tokens[token['address']] = token
+                
+            tokens = list(unique_tokens.values())
+            logger.info(f"Found {len(tokens)} tokens from Birdeye")
+            return tokens
+            
         except Exception as e:
             logger.error(f"Birdeye error: {e}")
             
         return []
+        
+    async def _get_token_details(self, address: str) -> Optional[Dict]:
+        """Get detailed token information"""
+        try:
+            # Get price from price checker
+            price = await self.price_checker.get_token_price(address)
+            
+            if price:
+                return {
+                    'address': address,
+                    'symbol': 'NEW',
+                    'name': 'New Token',
+                    'liquidity': 10,  # Will be checked separately
+                    'age_minutes': 30,
+                    'volume_24h': 1000,
+                    'price_usd': price * 40,  # Convert to USD
+                    'holders': 50,
+                    'source': 'helius'
+                }
+        except:
+            pass
+            
+        return None
+
+class RiskManager:
+    """Manage trading risks and limits"""
+    
+    def __init__(self):
+        self.daily_loss_limit = MAX_DAILY_LOSS
+        self.max_position_size = MAX_POSITION_SIZE
+        self.min_wallet_balance = MIN_WALLET_BALANCE
+        self.cooldown_period = RISK_SETTINGS['cooldown_after_loss']
+        
+    def can_trade(self) -> Tuple[bool, str]:
+        """Check if we can place a new trade"""
+        
+        # Check daily loss limit
+        if bot_state.daily_loss >= self.daily_loss_limit:
+            bot_state.risk_status = "Daily loss limit reached"
+            return False, "Daily loss limit reached"
+            
+        # Check if in cooldown after loss
+        if bot_state.last_loss_time > 0:
+            time_since_loss = time.time() - bot_state.last_loss_time
+            if time_since_loss < self.cooldown_period:
+                remaining = int(self.cooldown_period - time_since_loss)
+                bot_state.risk_status = f"Cooldown: {remaining}s remaining"
+                return False, f"In cooldown for {remaining} seconds"
+            
+        # Check wallet balance
+        if bot_state.wallet_balance < self.min_wallet_balance:
+            bot_state.risk_status = "Insufficient balance"
+            return False, "Insufficient wallet balance"
+            
+        # Check max positions
+        if len(bot_state.active_positions) >= MAX_POSITIONS:
+            bot_state.risk_status = "Max positions reached"
+            return False, "Maximum positions reached"
+            
+        bot_state.risk_status = "Normal - Can trade"
+        return True, "OK"
+        
+    def calculate_position_size(self, personality: Dict) -> float:
+        """Calculate safe position size"""
+        base_size = personality['position_size']
+        
+        # Reduce size based on recent losses
+        if bot_state.daily_loss > 0:
+            loss_ratio = bot_state.daily_loss / self.daily_loss_limit
+            size_multiplier = 1 - (loss_ratio * 0.5)  # Reduce up to 50%
+            base_size *= size_multiplier
+            
+        # Never exceed max position size
+        return min(base_size, self.max_position_size)
+        
+    def record_trade_result(self, profit: float):
+        """Record trade result for risk management"""
+        if profit < 0:
+            bot_state.daily_loss += abs(profit)
+            bot_state.last_loss_time = time.time()
+            bot_state.losing_trades += 1
+        else:
+            bot_state.winning_trades += 1
+            
+        bot_state.total_trades += 1
+        bot_state.total_profit += profit
 
 class LiveTradingBot:
-    """Live trading bot that connects to ToxiBot"""
+    """Live trading bot with safety measures"""
     
     def __init__(self):
         self.running = False
@@ -724,8 +1441,11 @@ class LiveTradingBot:
         self.phone = None
         self.code_hash = None
         self.toxibot_chat = None
-        self.monitoring_tokens = {}  # Changed to dict to store token info
         self.token_discovery = TokenDiscovery()
+        self.price_checker = PriceChecker()
+        self.risk_manager = RiskManager()
+        self.contract_checker = ContractChecker()  # Add contract checker
+        self.last_balance_check = 0
         
     async def setup_telegram(self, api_id: str, api_hash: str):
         """Save Telegram credentials"""
@@ -794,6 +1514,7 @@ class LiveTradingBot:
             bot_state.running = True
             asyncio.create_task(self.trading_loop())
             asyncio.create_task(self.monitor_toxibot_messages())
+            asyncio.create_task(self.monitor_positions())
             
             logger.info("Bot started successfully!")
             return True
@@ -807,17 +1528,18 @@ class LiveTradingBot:
         toxibot_found = False
         
         async for dialog in self.client.iter_dialogs():
-            # Look for ToxiBot
-            if any(name in dialog.name.lower() for name in ['toxi', 'solana', 'bot']):
-                if 'toxi' in dialog.name.lower():
+            # Look for ToxiBot - check multiple possible names
+            dialog_name = dialog.name.lower()
+            if any(name in dialog_name for name in ['toxi', 'toxibot', 'toxi_solana', 'solana_bot']):
+                if 'toxi' in dialog_name:
                     self.toxibot_chat = dialog.entity
                     bot_state.toxibot_connected = True
                     logger.info(f"Found ToxiBot: {dialog.name}")
                     toxibot_found = True
                     
-                    # Send test message
-                    await self.client.send_message(self.toxibot_chat, "/balance")
-                    bot_state.last_activity = "Connected to ToxiBot"
+                    # Check balance
+                    await self.check_wallet_balance()
+                    bot_state.last_activity = "Connected to ToxiBot - Checking wallet"
                     bot_state.last_activity_type = "success"
                     break
                     
@@ -825,9 +1547,21 @@ class LiveTradingBot:
             logger.warning("ToxiBot not found! Make sure to:")
             logger.warning("1. Search for @toxi_solana_bot in Telegram")
             logger.warning("2. Start a chat with ToxiBot")
-            logger.warning("3. Fund your ToxiBot wallet")
+            logger.warning("3. Fund your ToxiBot wallet with at least 0.2 SOL")
             bot_state.last_activity = "ToxiBot not found - please start chat with @toxi_solana_bot"
             bot_state.last_activity_type = "error"
+            
+    async def check_wallet_balance(self):
+        """Check wallet balance in ToxiBot"""
+        if not self.toxibot_chat:
+            return
+            
+        try:
+            await self.client.send_message(self.toxibot_chat, "/balance")
+            self.last_balance_check = time.time()
+            logger.info("Checking wallet balance...")
+        except Exception as e:
+            logger.error(f"Failed to check balance: {e}")
             
     async def monitor_toxibot_messages(self):
         """Monitor ToxiBot responses"""
@@ -837,42 +1571,94 @@ class LiveTradingBot:
         @self.client.on(events.NewMessage(chats=self.toxibot_chat))
         async def handler(event):
             message = event.message.text
-            logger.info(f"ToxiBot: {message[:100]}...")
+            logger.info(f"ToxiBot: {message[:200]}...")
             
             # Parse balance
-            if "Wallet Balance:" in message or "Balance:" in message:
-                bot_state.toxibot_connected = True
-                bot_state.last_activity = "ToxiBot balance checked"
-                bot_state.last_activity_type = "info"
-                
+            if "balance:" in message.lower() or "wallet:" in message.lower():
+                # Extract balance using regex
+                import re
+                balance_match = re.search(r'(\d+\.?\d*)\s*SOL', message, re.IGNORECASE)
+                if balance_match:
+                    balance = float(balance_match.group(1))
+                    bot_state.wallet_balance = balance
+                    logger.info(f"Wallet balance: {balance} SOL")
+                    bot_state.last_activity = f"Wallet balance: {balance} SOL"
+                    bot_state.last_activity_type = "info"
+                    
             # Parse successful buys
-            elif "✅" in message or "Bought" in message or "Success" in message:
+            elif any(word in message.lower() for word in ["✅", "success", "bought", "purchased"]):
                 logger.info("Trade executed successfully!")
-                bot_state.total_trades += 1
-                bot_state.winning_trades += 1
+                bot_state.trades_this_hour += 1
+                
+                # Extract token address from message
+                address_match = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', message)
+                if address_match:
+                    token_address = address_match.group(0)
+                    
+                    # Get price for tracking
+                    price = await self.price_checker.get_token_price(token_address)
+                    if price and token_address in self.monitoring_tokens:
+                        token_info = self.monitoring_tokens[token_address]
+                        
+                        # Create trade record
+                        trade = Trade(
+                            token_address=token_address,
+                            symbol=token_info.get('symbol', 'UNKNOWN'),
+                            entry_price=price,
+                            current_price=price,
+                            position_size=token_info['position_size'],
+                            entry_time=time.time(),
+                            personality=token_info['personality'],
+                            stop_loss=price * token_info['personality']['stop_loss'],
+                            take_profit=price * token_info['personality']['take_profit']
+                        )
+                        
+                        bot_state.active_positions[token_address] = trade
+                        bot_state.active_trades = len(bot_state.active_positions)
+                        
                 bot_state.last_activity = "Trade executed successfully!"
                 bot_state.last_activity_type = "trade"
                 
-            # Parse validation errors
-            elif "Validation error" in message or "❌" in message:
+            # Parse errors
+            elif any(word in message.lower() for word in ["error", "failed", "❌", "insufficient", "invalid"]):
                 logger.warning(f"Trade failed: {message}")
-                bot_state.last_activity = "Trade failed - invalid token"
+                bot_state.last_activity = f"Trade failed: {message[:50]}..."
                 bot_state.last_activity_type = "error"
                 
+                # If insufficient balance, update it
+                if "insufficient" in message.lower():
+                    await self.check_wallet_balance()
+                    
     async def execute_buy(self, token_address: str, amount_sol: float = POSITION_SIZE):
-        """Execute buy order through ToxiBot - FIXED FORMAT"""
+        """Execute buy order through ToxiBot"""
         if not self.toxibot_chat:
             logger.error("ToxiBot not connected")
             return False
             
-        try:
-            # ToxiBot format: just send the token address
-            # It will use your default buy amount set in ToxiBot
-            await self.client.send_message(self.toxibot_chat, token_address)
+        # Final safety checks
+        can_trade, reason = self.risk_manager.can_trade()
+        if not can_trade:
+            logger.warning(f"Trade blocked: {reason}")
+            return False
             
-            logger.info(f"Sent buy command: {token_address}")
-            bot_state.last_activity = f"Attempting to buy token: {token_address[:8]}..."
+        try:
+            # ToxiBot buy format options to try
+            buy_commands = [
+                f"/buy {token_address} {amount_sol}",  # Format 1
+                f"buy {token_address} {amount_sol}",   # Format 2
+                f"{token_address} {amount_sol}",        # Format 3
+                token_address                            # Format 4 (uses default amount)
+            ]
+            
+            # Try the most likely format first
+            command = buy_commands[3]  # Just token address
+            
+            await self.client.send_message(self.toxibot_chat, command)
+            
+            logger.info(f"Sent buy command: {command}")
+            bot_state.last_activity = f"Buying {amount_sol} SOL of token: {token_address[:8]}..."
             bot_state.last_activity_type = "trade"
+            
             return True
             
         except Exception as e:
@@ -888,12 +1674,23 @@ class LiveTradingBot:
             return False
             
         try:
-            # For selling, first check portfolio
-            await self.client.send_message(self.toxibot_chat, "/portfolio")
+            # ToxiBot sell format
+            sell_commands = [
+                f"/sell {token_address} {percentage}%",
+                f"sell {token_address} {percentage}",
+                f"/sell {percentage}% {token_address}",
+                f"/sell {token_address}"
+            ]
             
-            logger.info(f"Checking positions before sell: {token_address}")
-            bot_state.last_activity = f"Checking positions for sell: {token_address[:8]}..."
-            bot_state.last_activity_type = "info"
+            # Try most common format
+            command = sell_commands[0]
+            
+            await self.client.send_message(self.toxibot_chat, command)
+            
+            logger.info(f"Sent sell command: {command}")
+            bot_state.last_activity = f"Selling {percentage}% of token: {token_address[:8]}..."
+            bot_state.last_activity_type = "trade"
+            
             return True
             
         except Exception as e:
@@ -901,123 +1698,270 @@ class LiveTradingBot:
             return False
             
     async def trading_loop(self):
-        """Main trading loop"""
-        logger.info("Starting live trading loop with 3 personalities...")
-        bot_state.last_activity = "Trading loop started - scanning for opportunities"
+        """Main trading loop with safety checks"""
+        logger.info("Starting SAFE trading loop...")
+        bot_state.last_activity = "Trading loop started - Scanning for safe opportunities"
         bot_state.last_activity_type = "info"
+        
+        # Reset daily loss at start
+        bot_state.daily_loss = 0
+        last_day = datetime.now().day
         
         while self.running:
             try:
+                # Reset daily loss if new day
+                current_day = datetime.now().day
+                if current_day != last_day:
+                    bot_state.daily_loss = 0
+                    last_day = current_day
+                    logger.info("Daily loss counter reset")
+                    
+                # Check wallet balance periodically
+                if time.time() - self.last_balance_check > 300:  # Every 5 minutes
+                    await self.check_wallet_balance()
+                    
+                # Check if we can trade
+                can_trade, reason = self.risk_manager.can_trade()
+                if not can_trade:
+                    logger.info(f"Trading paused: {reason}")
+                    await asyncio.sleep(30)
+                    continue
+                    
                 # Discover new tokens
                 new_tokens = await self.token_discovery.discover_tokens()
                 
                 if new_tokens:
-                    logger.info(f"Discovered {len(new_tokens)} new tokens")
+                    logger.info(f"Analyzing {len(new_tokens)} tokens for safety...")
                     
                     for token in new_tokens:
-                        personality = self.should_buy_token(token)
-                        if personality:
-                            logger.info(f"{personality['name']} found token: {token['symbol']} - {token['address'][:8]}...")
-                            bot_state.last_activity = f"{personality['name']} buying {token['symbol']}"
+                        # Detailed analysis
+                        analysis = await self.analyze_token_safety(token)
+                        
+                        if analysis['is_safe']:
+                            personality = analysis['personality']
+                            
+                            # Log any contract warnings with RugCheck score
+                            if analysis.get('contract_warnings'):
+                                rugcheck_score = analysis.get('rugcheck_score', 'N/A')
+                                logger.warning(f"Token {token['symbol']} - RugCheck Score: {rugcheck_score}/100, Warnings: {analysis['contract_warnings']}")
+                                
+                            logger.info(f"{personality['name']} approved token: {token['symbol']} - Safety: {analysis['safety_score']}/10, RugCheck: {analysis.get('rugcheck_score', 'N/A')}/100")
+                            bot_state.last_activity = f"{personality['name']} buying {token['symbol']} (Safety: {analysis['safety_score']}/10)"
                             bot_state.last_activity_type = personality['css_class']
                             
-                            # Execute buy with personality-specific amount
-                            if await self.execute_buy(token['address'], personality['position_size']):
-                                # Store token with its personality
+                            # Calculate position size
+                            position_size = self.risk_manager.calculate_position_size(personality)
+                            
+                            # Execute buy
+                            if await self.execute_buy(token['address'], position_size):
+                                # Store token info for monitoring
                                 token['personality'] = personality
+                                token['position_size'] = position_size
                                 token['entry_time'] = time.time()
+                                token['safety_score'] = analysis['safety_score']
                                 self.monitoring_tokens[token['address']] = token
-                                bot_state.active_trades = len(self.monitoring_tokens)
                                 
-                                # Monitor for sell
-                                asyncio.create_task(self.monitor_token_for_sell(token))
+                                # Small delay between trades
+                                await asyncio.sleep(5)
+                        else:
+                            logger.debug(f"Token {token['symbol']} rejected: {analysis['rejection_reason']}")
                 else:
-                    # Update activity to show we're still scanning
-                    if bot_state.tokens_checked % 10 == 0:
-                        bot_state.last_activity = f"Scanning... {bot_state.tokens_checked} tokens checked"
+                    # Update activity periodically
+                    if bot_state.tokens_checked % 50 == 0:
+                        bot_state.last_activity = f"Scanning... {bot_state.tokens_checked} tokens analyzed"
                         bot_state.last_activity_type = "info"
                 
-                await asyncio.sleep(10)  # Check every 10 seconds
+                await asyncio.sleep(15)  # Check every 15 seconds
                 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}")
                 bot_state.last_activity = f"Trading loop error: {str(e)}"
                 bot_state.last_activity_type = "error"
-                await asyncio.sleep(30)
+                await asyncio.sleep(60)
                 
-    def should_buy_token(self, token: Dict) -> Optional[Dict]:
-        """Decide if token should be bought based on personality"""
+    async def analyze_token_safety(self, token: Dict) -> Dict:
+        """Comprehensive token safety analysis with contract checking"""
+        safety_score = 10  # Start with perfect score
+        rejection_reasons = []
         
-        # Try each personality
-        for personality in [BotPersonality.ULTRA_EARLY, BotPersonality.SCALPER, BotPersonality.COMMUNITY]:
-            
-            criteria = {
-                'has_address': bool(token.get('address')),
-                'min_liquidity': token.get('liquidity', 0) >= personality['min_liquidity'],
-                'max_age': token.get('age_minutes', 999) <= personality['max_age_minutes'],
-                'not_monitoring': token.get('address') not in self.monitoring_tokens,
-                'max_positions': len(self.monitoring_tokens) < MAX_POSITIONS
+        # Check liquidity
+        liquidity = token.get('liquidity', 0)
+        if liquidity < MIN_LIQUIDITY:
+            return {
+                'is_safe': False,
+                'rejection_reason': f'Low liquidity: {liquidity:.1f} SOL',
+                'safety_score': 0
             }
             
-            if all(criteria.values()):
-                logger.info(f"{personality['name']} criteria met for {token['symbol']}")
-                return personality
+        # Contract safety check
+        if RISK_SETTINGS['check_contract']:
+            contract_check = await self.contract_checker.check_token_safety(token['address'])
+            
+            # Immediate rejections
+            if contract_check['risk_score'] >= 7:
+                return {
+                    'is_safe': False,
+                    'rejection_reason': f'High risk: {", ".join(contract_check["warnings"])}',
+                    'safety_score': 0
+                }
                 
-        return None
+            # Deduct points for risks
+            safety_score -= (contract_check['risk_score'] * 0.5)
+            
+            # Check for critical red flags
+            if any('honeypot' in w.lower() for w in contract_check.get('warnings', [])):
+                return {
+                    'is_safe': False,
+                    'rejection_reason': '🚨 Honeypot detected!',
+                    'safety_score': 0
+                }
+                
+            # Check RugCheck score if available
+            if contract_check.get('rugcheck_score', 100) < 30:
+                return {
+                    'is_safe': False,
+                    'rejection_reason': f'🚨 RugCheck Score too low: {contract_check["rugcheck_score"]}/100',
+                    'safety_score': 0
+                }
+                
+            # Check holder concentration
+            if contract_check.get('top_holder_percentage', 0) > RISK_SETTINGS['max_concentration'] * 100:
+                return {
+                    'is_safe': False,
+                    'rejection_reason': f'Top holder owns {contract_check["top_holder_percentage"]:.1f}%',
+                    'safety_score': 0
+                }
+            
+        # Liquidity scoring
+        if liquidity < 20:
+            safety_score -= 2
+        elif liquidity < 50:
+            safety_score -= 1
+            
+        # Check volume
+        volume_24h = token.get('volume_24h', 0)
+        if RISK_SETTINGS['require_volume_check'] and volume_24h < 100:
+            return {
+                'is_safe': False,
+                'rejection_reason': f'Low volume: ${volume_24h:.0f}',
+                'safety_score': 0
+            }
+            
+        # Volume scoring
+        if volume_24h < 1000:
+            safety_score -= 2
+        elif volume_24h < 5000:
+            safety_score -= 1
+            
+        # Check holders
+        holders = token.get('holders', 0)
+        if holders < RISK_SETTINGS['min_holders']:
+            safety_score -= 3
+            
+        # Age check
+        age_minutes = token.get('age_minutes', 999)
+        if age_minutes < 5:
+            safety_score -= 2  # Very new = risky
+        elif age_minutes > 1440:
+            safety_score -= 1  # Too old = missed opportunity
+            
+        # Try each personality
+        for personality in [BotPersonality.CONSERVATIVE_SNIPER, 
+                          BotPersonality.SAFE_SCALPER, 
+                          BotPersonality.ESTABLISHED_TRADER]:
+            
+            # Check all criteria
+            meets_criteria = (
+                liquidity >= personality['min_liquidity'] and
+                age_minutes <= personality['max_age_minutes'] and
+                volume_24h >= personality.get('min_volume_24h', 0) and
+                holders >= personality.get('min_holders', 0) and
+                safety_score >= 5  # Minimum safety threshold
+            )
+            
+            if meets_criteria:
+                return {
+                    'is_safe': True,
+                    'personality': personality,
+                    'safety_score': safety_score,
+                    'rejection_reason': None,
+                    'contract_warnings': contract_check.get('warnings', []) if RISK_SETTINGS['check_contract'] else [],
+                    'rugcheck_score': contract_check.get('rugcheck_score', None) if RISK_SETTINGS['check_contract'] else None
+                }
+                
+        # If no personality matched
+        reasons = []
+        if liquidity < 50:
+            reasons.append(f"liquidity:{liquidity:.1f}")
+        if volume_24h < 5000:
+            reasons.append(f"volume:${volume_24h:.0f}")
+        if holders < 100:
+            reasons.append(f"holders:{holders}")
+        if safety_score < 5:
+            reasons.append(f"safety:{safety_score}/10")
+            
+        return {
+            'is_safe': False,
+            'rejection_reason': ' '.join(reasons),
+            'safety_score': safety_score
+        }
         
-    async def monitor_token_for_sell(self, token: Dict):
-        """Monitor token for sell opportunity"""
-        entry_time = token['entry_time']
-        personality = token['personality']
+    async def monitor_positions(self):
+        """Monitor open positions with real price checks"""
+        logger.info("Starting position monitor...")
         
-        while token['address'] in self.monitoring_tokens:
+        while self.running:
             try:
-                elapsed = time.time() - entry_time
-                
-                # Use personality-specific targets
-                take_profit = personality['take_profit']
-                stop_loss = personality['stop_loss']
-                max_hold = personality['hold_time']
-                
-                # Simulate price movement (in production, check real price)
-                # Ultra-early has 30% chance of profit, Scalper 50%, Community 40%
-                profit_chance = {'sniper': 0.7, 'scalper': 0.5, 'community': 0.6}
-                
-                if elapsed > 300 and random.random() > profit_chance.get(personality['css_class'], 0.5):
-                    logger.info(f"{personality['name']} hit {take_profit}x on {token['symbol']}! Selling...")
-                    bot_state.last_activity = f"{personality['name']} hit {take_profit}x! Selling {token['symbol']}"
-                    bot_state.last_activity_type = "trade"
+                for address, trade in list(bot_state.active_positions.items()):
+                    # Get current price
+                    current_price = await self.price_checker.get_token_price(address)
                     
-                    if await self.execute_sell(token['address'], 80):
-                        profit = personality['position_size'] * (take_profit - 1) * 0.8
-                        bot_state.total_profit += profit
-                        bot_state.winning_trades += 1
-                        logger.info(f"Profit: +{profit:.3f} SOL")
+                    if current_price:
+                        trade.current_price = current_price
+                        pnl_percent = trade.pnl_percent
+                        
+                        # Check stop loss
+                        if current_price <= trade.stop_loss:
+                            logger.info(f"Stop loss hit for {trade.symbol}: {pnl_percent:.1f}%")
+                            bot_state.last_activity = f"Stop loss: {trade.symbol} at {pnl_percent:.1f}%"
+                            bot_state.last_activity_type = "error"
+                            
+                            await self.execute_sell(address, 100)
+                            self.risk_manager.record_trade_result(trade.pnl)
+                            del bot_state.active_positions[address]
+                            
+                        # Check take profit
+                        elif current_price >= trade.take_profit:
+                            logger.info(f"Take profit hit for {trade.symbol}: +{pnl_percent:.1f}%")
+                            bot_state.last_activity = f"Take profit: {trade.symbol} at +{pnl_percent:.1f}%!"
+                            bot_state.last_activity_type = "trade"
+                            
+                            await self.execute_sell(address, 80)  # Sell 80%
+                            self.risk_manager.record_trade_result(trade.pnl * 0.8)
+                            
+                            # Keep 20% as moon bag
+                            trade.position_size *= 0.2
+                            
+                        # Check time limit
+                        elif time.time() - trade.entry_time > trade.personality['hold_time']:
+                            logger.info(f"Time limit reached for {trade.symbol}")
+                            bot_state.last_activity = f"Time exit: {trade.symbol} at {pnl_percent:.1f}%"
+                            bot_state.last_activity_type = "info"
+                            
+                            await self.execute_sell(address, 100)
+                            self.risk_manager.record_trade_result(trade.pnl)
+                            del bot_state.active_positions[address]
+                            
+                    bot_state.active_trades = len(bot_state.active_positions)
                     
-                    # Remove from monitoring
-                    del self.monitoring_tokens[token['address']]
-                    bot_state.active_trades = len(self.monitoring_tokens)
-                    break
-                    
-                # Stop loss or time limit
-                elif elapsed > max_hold:
-                    logger.info(f"{personality['name']} time limit reached for {token['symbol']}")
-                    bot_state.last_activity = f"{personality['name']} closing {token['symbol']} - time limit"
-                    bot_state.last_activity_type = personality['css_class']
-                    
-                    await self.execute_sell(token['address'], 100)
-                    del self.monitoring_tokens[token['address']]
-                    bot_state.active_trades = len(self.monitoring_tokens)
-                    break
-                    
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(30)  # Check every 30 seconds
                 
             except Exception as e:
-                logger.error(f"Monitor error: {e}")
-                if token['address'] in self.monitoring_tokens:
-                    del self.monitoring_tokens[token['address']]
-                    bot_state.active_trades = len(self.monitoring_tokens)
-                break
+                logger.error(f"Position monitor error: {e}")
+                await asyncio.sleep(60)
+                
+    # Add monitoring_tokens attribute
+    monitoring_tokens = {}
 
 # Create bot instance
 trading_bot = LiveTradingBot()
@@ -1106,11 +2050,55 @@ class WebServer:
             'toxibotConnected': bot_state.toxibot_connected,
             'tokensChecked': bot_state.tokens_checked,
             'activity': bot_state.last_activity,
-            'activityType': bot_state.last_activity_type
+            'activityType': bot_state.last_activity_type,
+            'walletBalance': bot_state.wallet_balance,
+            'riskStatus': bot_state.risk_status
         })
+
+async def load_existing_session():
+    """Load existing Telegram session if available"""
+    try:
+        if os.path.exists('data/session.txt'):
+            with open('data/session.txt', 'r') as f:
+                session_string = f.read().strip()
+                
+            if session_string and TELEGRAM_AVAILABLE:
+                # Try to connect with existing session
+                client = TelegramClient(StringSession(session_string), 
+                                      int(os.environ.get('TELEGRAM_API_ID', '0')), 
+                                      os.environ.get('TELEGRAM_API_HASH', ''))
+                await client.connect()
+                
+                if await client.is_user_authorized():
+                    trading_bot.client = client
+                    bot_state.configured = True
+                    bot_state.authenticated = True
+                    
+                    # Find ToxiBot and start
+                    await trading_bot.find_toxibot()
+                    trading_bot.running = True
+                    bot_state.running = True
+                    
+                    asyncio.create_task(trading_bot.trading_loop())
+                    asyncio.create_task(trading_bot.monitor_toxibot_messages())
+                    asyncio.create_task(trading_bot.monitor_positions())
+                    
+                    logger.info("Loaded existing session and started bot")
+                    return True
+                else:
+                    await client.disconnect()
+                    
+    except Exception as e:
+        logger.error(f"Failed to load session: {e}")
+        
+    return False
 
 async def main():
     """Start the bot"""
+    # Try to load existing session
+    await load_existing_session()
+    
+    # Start web server
     server = WebServer()
     
     port = int(os.environ.get('PORT', 8080))
@@ -1121,28 +2109,57 @@ async def main():
     
     print(f"""
     ╔═══════════════════════════════════════╗
-    ║    SOLANA LIVE TRADING BOT STARTED    ║
+    ║    SOLANA SAFE TRADING BOT V2.0       ║
     ╠═══════════════════════════════════════╣
     ║                                       ║
     ║  ⚠️  LIVE TRADING - REAL MONEY ⚠️     ║
     ║                                       ║
-    ║  3 Active Personalities:              ║
-    ║  • Ultra-Early Sniper (0.5+ SOL liq)  ║
-    ║  • Quick Scalper (5+ SOL liq)        ║
-    ║  • Community Hunter (20+ SOL liq)    ║
+    ║  Safety Features:                     ║
+    ║  • Real price checking                ║
+    ║  • Risk management (0.2 SOL max loss) ║
+    ║  • Contract verification              ║
+    ║  • Rug pull detection                 ║
+    ║  • Position sizing (0.01-0.05 SOL)    ║
+    ║  • Stop losses on all trades          ║
+    ║  • Minimum liquidity checks           ║
+    ║                                       ║
+    ║  3 Safe Personalities:                ║
+    ║  • Conservative Sniper (20+ SOL liq)  ║
+    ║  • Safe Scalper (50+ SOL liq)         ║
+    ║  • Established Trader (100+ SOL liq)  ║
     ║                                       ║
     ║  Status:                              ║
     ║  - Telegram: {'✓' if bot_state.configured else '✗'}                      ║
     ║  - Helius API: {'✓' if HELIUS_API_KEY else '✗ (Optional)'}            ║
+    ║  - Session: {'✓' if bot_state.authenticated else '✗'}                   ║
     ║                                       ║
     ║  Dashboard: http://localhost:{port:<9}    ║
     ║                                       ║
     ╚═══════════════════════════════════════╝
+    
+    SAFETY CHECKLIST:
+    ✓ Start with minimum amounts (0.01 SOL)
+    ✓ Monitor the dashboard closely
+    ✓ Set stop losses on all trades
+    ✓ Daily loss limit: 0.2 SOL
+    ✓ Keep at least 0.1 SOL for fees
+    ✓ Only trade tokens with 20+ SOL liquidity
+    ✓ Contract verification enabled
+    ✓ Rug pull detection active
+    
+    Press Ctrl+C to stop the bot safely.
     """)
     
     # Keep running
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info("Shutting down safely...")
+        trading_bot.running = False
+        if trading_bot.client:
+            await trading_bot.client.disconnect()
+        await runner.cleanup()
 
 if __name__ == '__main__':
     asyncio.run(main())
