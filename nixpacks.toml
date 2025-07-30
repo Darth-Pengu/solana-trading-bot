@@ -1,8 +1,15 @@
 [phases.setup]
-nixPkgs = ["python311", "gcc", "openssl", "libffi", "zlib"]
+nixPkgs = ["python311", "python311Packages.pip", "gcc", "openssl", "libffi", "zlib", "python311Packages.setuptools", "python311Packages.wheel"]
 
 [phases.install]
-cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+cmds = [
+    "python -m ensurepip",
+    "python -m pip install --upgrade pip setuptools wheel",
+    "python -m pip install --no-cache-dir -r requirements.txt"
+]
 
 [start]
 cmd = "python main.py"
+
+[variables]
+PYTHONUNBUFFERED = "1"
