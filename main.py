@@ -1,8 +1,38 @@
 #!/usr/bin/env python3
-"""
-SOLANA TRADING BOT - FIXED VERSION WITH SAFETY MEASURES
-Includes real price checking, risk management, and proper error handling
-"""
+
+import sys
+import os
+import asyncio
+import json
+import time
+import logging
+import random
+import aiohttp
+import re
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from aiohttp import web
+from dataclasses import dataclass, field
+
+# Unbuffered output for logging in Railway
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+logging.basicConfig(...)
+logger = logging.getLogger('TradingBot')
+
+# Get environment variables safely
+TELEGRAM_API_ID = os.environ.get('TELEGRAM_API_ID', os.environ.get('TG_API_ID', ''))
+TELEGRAM_API_HASH = os.environ.get('TELEGRAM_API_HASH', os.environ.get('TG_API_HASH', ''))
+HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '')
+# ... and so on
+
+# Fail if required variables are missing for safety
+if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+    logger.error("Missing Telegram API credentials. Please set TELEGRAM_API_ID and TELEGRAM_API_HASH.")
+    sys.exit(1)
+
+# ...rest of your code...
 
 import sys
 import os
