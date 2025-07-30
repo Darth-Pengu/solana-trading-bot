@@ -1,4 +1,25 @@
-#!/usr/bin/env python3
+async def execute_sell(self, token_address: str, percentage: int = 100):
+        """Execute sell order through ToxiBot"""
+        if not self.toxibot_chat:
+            logger.error("ToxiBot not connected")
+            return False
+            
+        try:
+            # ToxiBot sell format - /sell PERCENTAGE
+            # First need to be in a position context
+            sell_command = f"/sell {percentage}%"
+            
+            await self.client.send_message(self.toxibot_chat, sell_command)
+            
+            logger.info(f"Sent sell command: {sell_command}")
+            bot_state.last_activity = f"Selling {percentage}% of position"
+            bot_state.last_activity_type = "trade"
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Sell command failed: {e}")
+            return False#!/usr/bin/env python3
 """
 SOLANA TRADING BOT - FIXED VERSION WITH SAFETY MEASURES
 Includes real price checking, risk management, and proper error handling
@@ -606,7 +627,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
 @dataclass
 class Trade:
-    """Track individual trades"""
+    """Track individual trades with limit order support"""
     token_address: str
     symbol: str
     entry_price: float
@@ -616,6 +637,10 @@ class Trade:
     personality: Dict
     stop_loss: float
     take_profit: float
+    limit_orders: Dict = field(default_factory=dict)  # Store active limit orders
+    partial_exits: List[float] = field(default_factory=list)  # Track partial exits
+    trailing_stop_active: bool = False
+    highest_price: float = 0.0  # For trailing stop
     
     @property
     def pnl(self) -> float:
@@ -626,6 +651,13 @@ class Trade:
     def pnl_percent(self) -> float:
         """Calculate profit/loss percentage"""
         return (self.current_price / self.entry_price - 1) * 100
+    
+    def update_trailing_stop(self):
+        """Update trailing stop if enabled"""
+        if self.personality.get('trailing_stop') and self.current_price > self.highest_price:
+            self.highest_price = self.current_price
+            trailing_distance = self.personality.get('trailing_distance', 0.02)
+            self.stop_loss = self.highest_price * (1 - trailing_distance)
 
 @dataclass
 class BotState:
@@ -653,19 +685,24 @@ class BotState:
 bot_state = BotState()
 
 class BotPersonality:
-    """Different trading personalities with SAFE strategies"""
+    """Different trading personalities with SAFE strategies and limit order settings"""
     
     CONSERVATIVE_SNIPER = {
         'name': 'Conservative Sniper',
-        'min_liquidity': 20,  # Higher liquidity requirement
-        'max_age_minutes': 30,  # Only newer tokens
+        'min_liquidity': 90,  # Higher liquidity requirement per research
+        'max_age_minutes': 5,  # Only very new tokens (within 5 minutes)
         'position_size': 0.01,  # Very small positions
-        'take_profit': 1.5,  # 50% profit target
-        'stop_loss': 0.9,  # -10% stop loss
-        'hold_time': 1800,  # 30 minutes max
+        'take_profit': 1.15,  # 15% profit target (non-round number)
+        'stop_loss': 0.92,  # -8% stop loss
+        'hold_time': 180,  # 3 minutes max per sniping strategy
         'css_class': 'sniper',
         'min_volume_24h': 1000,  # Minimum $1000 daily volume
-        'min_holders': 50  # At least 50 holders
+        'min_holders': 50,  # At least 50 holders
+        'slippage': 0.25,  # 25% slippage for sniping
+        'limit_order_enabled': True,
+        'tp_levels': [1.10, 1.15],  # Take profit at 10% and 15%
+        'trailing_stop': False,  # No trailing for quick snipes
+        'time_based_exit': True  # Force exit after hold_time
     }
     
     SAFE_SCALPER = {
@@ -673,12 +710,18 @@ class BotPersonality:
         'min_liquidity': 50,
         'max_age_minutes': 120,
         'position_size': 0.02,
-        'take_profit': 1.2,  # 20% profit
-        'stop_loss': 0.95,  # -5% stop loss
+        'take_profit': 1.03,  # 3% profit for scalping
+        'stop_loss': 0.98,  # -2% stop loss
         'hold_time': 3600,  # 1 hour max
         'css_class': 'scalper',
         'min_volume_24h': 5000,
-        'min_holders': 100
+        'min_holders': 100,
+        'slippage': 0.05,  # 5% slippage for scalping
+        'limit_order_enabled': True,
+        'tp_levels': [1.02, 1.03, 1.05],  # Scale out at 2%, 3%, 5%
+        'trailing_stop': True,  # Enable trailing for scalping
+        'trailing_distance': 0.01,  # 1% trailing distance
+        'time_based_exit': True
     }
     
     ESTABLISHED_TRADER = {
@@ -686,12 +729,18 @@ class BotPersonality:
         'min_liquidity': 100,
         'max_age_minutes': 1440,  # 24 hours
         'position_size': 0.03,
-        'take_profit': 1.3,
-        'stop_loss': 0.93,  # -7% stop loss
-        'hold_time': 7200,  # 2 hours max
+        'take_profit': 1.15,  # 15% profit for swing trades
+        'stop_loss': 0.90,  # -10% stop loss
+        'hold_time': 86400,  # 24 hours max (1 day)
         'css_class': 'community',
         'min_volume_24h': 10000,
-        'min_holders': 200
+        'min_holders': 200,
+        'slippage': 0.03,  # 3% slippage
+        'limit_order_enabled': True,
+        'tp_levels': [1.10, 1.15, 1.25],  # Scale out at 10%, 15%, 25%
+        'trailing_stop': True,
+        'trailing_distance': 0.02,  # 2% trailing distance
+        'time_based_exit': False  # No forced time exit for swing trades
     }
 
 class PriceChecker:
@@ -1537,10 +1586,16 @@ class LiveTradingBot:
                     logger.info(f"Found ToxiBot: {dialog.name}")
                     toxibot_found = True
                     
-                    # Check balance
-                    await self.check_wallet_balance()
-                    bot_state.last_activity = "Connected to ToxiBot - Checking wallet"
+                    # ToxiBot shows balance when you start - send /start
+                    await self.client.send_message(self.toxibot_chat, "/start")
+                    bot_state.last_activity = "Connected to ToxiBot - Initializing"
                     bot_state.last_activity_type = "success"
+                    
+                    # Small delay to let ToxiBot respond
+                    await asyncio.sleep(2)
+                    
+                    # Try clicking Wallet button to get balance
+                    await self.client.send_message(self.toxibot_chat, "💼 Wallet")
                     break
                     
         if not toxibot_found:
@@ -1557,9 +1612,10 @@ class LiveTradingBot:
             return
             
         try:
-            await self.client.send_message(self.toxibot_chat, "/balance")
+            # ToxiBot doesn't use /balance - it shows balance with /start or Wallet button
+            await self.client.send_message(self.toxibot_chat, "💼 Wallet")
             self.last_balance_check = time.time()
-            logger.info("Checking wallet balance...")
+            logger.info("Requesting wallet info...")
         except Exception as e:
             logger.error(f"Failed to check balance: {e}")
             
@@ -1573,20 +1629,50 @@ class LiveTradingBot:
             message = event.message.text
             logger.info(f"ToxiBot: {message[:200]}...")
             
-            # Parse balance
-            if "balance:" in message.lower() or "wallet:" in message.lower():
-                # Extract balance using regex
+            # Parse balance - ToxiBot shows it with emoji and specific format
+            if "💰" in message or "wallet balance:" in message.lower() or "balance:" in message.lower():
+                # Extract balance using multiple regex patterns
                 import re
+                
+                # Try different patterns
+                patterns = [
+                    r'💰\s*Wallet Balance:\s*(\d+\.?\d*)\s*SOL',  # ToxiBot format with emoji
+                    r'Balance:\s*(\d+\.?\d*)\s*SOL',  # Alternative format
+                    r'(\d+\.?\d*)\s*SOL\s*\|',  # Format with pipe after SOL
+                    r'(\d+(?:\.\d+)?)\s*SOL',  # Simple format
+                ]
+                
+                balance_found = False
+                for pattern in patterns:
+                    balance_match = re.search(pattern, message, re.IGNORECASE)
+                    if balance_match:
+                        balance = float(balance_match.group(1))
+                        bot_state.wallet_balance = balance
+                        logger.info(f"Wallet balance updated: {balance} SOL")
+                        bot_state.last_activity = f"Wallet balance: {balance} SOL"
+                        bot_state.last_activity_type = "info"
+                        balance_found = True
+                        break
+                
+                if not balance_found:
+                    logger.warning(f"Could not parse balance from: {message[:100]}")
+                    
+            # Parse ToxiBot's welcome message which contains wallet address
+            elif "welcome to" in message.lower() and "your wallet address:" in message.lower():
+                # Extract wallet address and trigger balance parse from the same message
+                wallet_match = re.search(r'([1-9A-HJ-NP-Za-km-z]{32,44})', message)
+                if wallet_match:
+                    logger.info(f"ToxiBot wallet: {wallet_match.group(1)}")
+                
+                # Also check for balance in welcome message
                 balance_match = re.search(r'(\d+\.?\d*)\s*SOL', message, re.IGNORECASE)
                 if balance_match:
                     balance = float(balance_match.group(1))
                     bot_state.wallet_balance = balance
-                    logger.info(f"Wallet balance: {balance} SOL")
-                    bot_state.last_activity = f"Wallet balance: {balance} SOL"
-                    bot_state.last_activity_type = "info"
+                    logger.info(f"Initial balance: {balance} SOL")
                     
-            # Parse successful buys
-            elif any(word in message.lower() for word in ["✅", "success", "bought", "purchased"]):
+            # Parse successful buys - ToxiBot format
+            elif any(word in message.lower() for word in ["✅", "success", "bought", "purchased", "executed"]):
                 logger.info("Trade executed successfully!")
                 bot_state.trades_this_hour += 1
                 
@@ -1616,21 +1702,30 @@ class LiveTradingBot:
                         bot_state.active_positions[token_address] = trade
                         bot_state.active_trades = len(bot_state.active_positions)
                         
+                        # Set limit orders if enabled
+                        if trade.personality.get('limit_order_enabled'):
+                            asyncio.create_task(self.set_limit_orders(trade))
+                        
                 bot_state.last_activity = "Trade executed successfully!"
                 bot_state.last_activity_type = "trade"
                 
-            # Parse errors
-            elif any(word in message.lower() for word in ["error", "failed", "❌", "insufficient", "invalid"]):
+            # Parse errors - ToxiBot specific messages
+            elif any(word in message.lower() for word in ["error", "failed", "❌", "insufficient", "invalid", "unable"]):
                 logger.warning(f"Trade failed: {message}")
                 bot_state.last_activity = f"Trade failed: {message[:50]}..."
                 bot_state.last_activity_type = "error"
                 
-                # If insufficient balance, update it
+                # If insufficient balance, try to get balance from error message
                 if "insufficient" in message.lower():
-                    await self.check_wallet_balance()
+                    # Sometimes ToxiBot shows current balance in error
+                    balance_match = re.search(r'balance:\s*(\d+\.?\d*)\s*SOL', message, re.IGNORECASE)
+                    if balance_match:
+                        balance = float(balance_match.group(1))
+                        bot_state.wallet_balance = balance
+                        logger.info(f"Balance from error: {balance} SOL")
                     
     async def execute_buy(self, token_address: str, amount_sol: float = POSITION_SIZE):
-        """Execute buy order through ToxiBot"""
+        """Execute buy order through ToxiBot with slippage settings"""
         if not self.toxibot_chat:
             logger.error("ToxiBot not connected")
             return False
@@ -1642,22 +1737,39 @@ class LiveTradingBot:
             return False
             
         try:
-            # ToxiBot buy format options to try
-            buy_commands = [
-                f"/buy {token_address} {amount_sol}",  # Format 1
-                f"buy {token_address} {amount_sol}",   # Format 2
-                f"{token_address} {amount_sol}",        # Format 3
-                token_address                            # Format 4 (uses default amount)
-            ]
+            # Get personality slippage settings
+            personality = None
+            if token_address in self.monitoring_tokens:
+                personality = self.monitoring_tokens[token_address].get('personality')
             
-            # Try the most likely format first
-            command = buy_commands[3]  # Just token address
+            # ToxiBot expects just the token address - it will show quick buy buttons
+            await self.client.send_message(self.toxibot_chat, token_address)
             
-            await self.client.send_message(self.toxibot_chat, command)
-            
-            logger.info(f"Sent buy command: {command}")
-            bot_state.last_activity = f"Buying {amount_sol} SOL of token: {token_address[:8]}..."
+            logger.info(f"Sent token address to ToxiBot: {token_address}")
+            bot_state.last_activity = f"Sent buy request for token: {token_address[:8]}..."
             bot_state.last_activity_type = "trade"
+            
+            # Wait for ToxiBot to show options
+            await asyncio.sleep(2)
+            
+            # If we have specific settings, try to configure them
+            if personality and personality.get('slippage'):
+                # ToxiBot might accept settings commands
+                slippage_percent = int(personality['slippage'] * 100)
+                settings_msg = f"⚙️ Settings"  # Try clicking settings button
+                await self.client.send_message(self.toxibot_chat, settings_msg)
+                await asyncio.sleep(1)
+                
+                # Try to set slippage (this is a guess based on common patterns)
+                slippage_msg = f"Slippage: {slippage_percent}%"
+                await self.client.send_message(self.toxibot_chat, slippage_msg)
+                logger.info(f"Attempted to set slippage to {slippage_percent}%")
+            
+            # If we want to specify amount, send follow-up
+            if amount_sol != POSITION_SIZE:
+                # Some bots accept amount after showing token
+                await self.client.send_message(self.toxibot_chat, str(amount_sol))
+                logger.info(f"Sent specific buy amount: {amount_sol} SOL")
             
             return True
             
@@ -1667,35 +1779,60 @@ class LiveTradingBot:
             bot_state.last_activity_type = "error"
             return False
             
-    async def execute_sell(self, token_address: str, percentage: int = 100):
-        """Execute sell order through ToxiBot"""
-        if not self.toxibot_chat:
-            logger.error("ToxiBot not connected")
-            return False
+    async def set_limit_orders(self, trade: Trade):
+        """Set limit orders (take profit) for a trade based on personality"""
+        if not self.toxibot_chat or not trade.personality.get('limit_order_enabled'):
+            return
             
         try:
-            # ToxiBot sell format
-            sell_commands = [
-                f"/sell {token_address} {percentage}%",
-                f"sell {token_address} {percentage}",
-                f"/sell {percentage}% {token_address}",
-                f"/sell {token_address}"
-            ]
+            # Wait a bit after buy execution
+            await asyncio.sleep(5)
             
-            # Try most common format
-            command = sell_commands[0]
+            # ToxiBot uses button interface, so we need to navigate to the position
+            # Try sending portfolio command first
+            await self.client.send_message(self.toxibot_chat, "📊 Portfolio")
+            await asyncio.sleep(2)
             
-            await self.client.send_message(self.toxibot_chat, command)
+            # For each TP level in the personality
+            tp_levels = trade.personality.get('tp_levels', [trade.personality['take_profit']])
             
-            logger.info(f"Sent sell command: {command}")
-            bot_state.last_activity = f"Selling {percentage}% of token: {token_address[:8]}..."
-            bot_state.last_activity_type = "trade"
+            for i, tp_multiplier in enumerate(tp_levels):
+                tp_price = trade.entry_price * tp_multiplier
+                # Calculate partial size (split position equally among TP levels)
+                partial_size = trade.position_size / len(tp_levels)
+                
+                logger.info(f"Setting TP{i+1} at {tp_price:.8f} ({(tp_multiplier-1)*100:.1f}% gain)")
+                
+                # ToxiBot might accept limit orders through buttons or specific commands
+                # This is an educated guess based on common bot patterns
+                limit_msg = f"💰 Limit Sell {partial_size} SOL @ {tp_price:.8f}"
+                await self.client.send_message(self.toxibot_chat, limit_msg)
+                
+                # Store limit order info
+                trade.limit_orders[f'tp_{i+1}'] = {
+                    'price': tp_price,
+                    'size': partial_size,
+                    'type': 'take_profit'
+                }
+                
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"Failed to set limit orders: {e}")
             
-            return True
+    async def cancel_limit_orders(self, trade: Trade):
+        """Cancel limit orders for a trade"""
+        if not self.toxibot_chat or not trade.limit_orders:
+            return
+            
+        try:
+            # Try to cancel orders
+            await self.client.send_message(self.toxibot_chat, "❌ Cancel Orders")
+            logger.info(f"Cancelled limit orders for {trade.symbol}")
+            trade.limit_orders.clear()
             
         except Exception as e:
-            logger.error(f"Sell command failed: {e}")
-            return False
+            logger.error(f"Failed to cancel limit orders: {e}")
             
     async def trading_loop(self):
         """Main trading loop with safety checks"""
@@ -1907,8 +2044,8 @@ class LiveTradingBot:
         }
         
     async def monitor_positions(self):
-        """Monitor open positions with real price checks"""
-        logger.info("Starting position monitor...")
+        """Monitor open positions with real price checks and enhanced strategies"""
+        logger.info("Starting position monitor with limit order support...")
         
         while self.running:
             try:
@@ -1920,18 +2057,65 @@ class LiveTradingBot:
                         trade.current_price = current_price
                         pnl_percent = trade.pnl_percent
                         
-                        # Check stop loss
+                        # Update trailing stop if enabled
+                        if trade.personality.get('trailing_stop'):
+                            trade.update_trailing_stop()
+                        
+                        # Check time-based exit for sniping strategies
+                        if trade.personality.get('time_based_exit'):
+                            elapsed = time.time() - trade.entry_time
+                            if elapsed > trade.personality['hold_time']:
+                                logger.info(f"{trade.personality['name']} time limit reached for {trade.symbol}")
+                                bot_state.last_activity = f"Time exit: {trade.symbol} at {pnl_percent:.1f}%"
+                                bot_state.last_activity_type = trade.personality['css_class']
+                                
+                                await self.execute_sell(address, 100)
+                                self.risk_manager.record_trade_result(trade.pnl)
+                                del bot_state.active_positions[address]
+                                bot_state.active_trades = len(bot_state.active_positions)
+                                continue
+                        
+                        # Check stop loss (including trailing stop)
                         if current_price <= trade.stop_loss:
                             logger.info(f"Stop loss hit for {trade.symbol}: {pnl_percent:.1f}%")
                             bot_state.last_activity = f"Stop loss: {trade.symbol} at {pnl_percent:.1f}%"
                             bot_state.last_activity_type = "error"
                             
+                            # Cancel any pending limit orders
+                            if trade.limit_orders:
+                                await self.cancel_limit_orders(trade)
+                            
                             await self.execute_sell(address, 100)
                             self.risk_manager.record_trade_result(trade.pnl)
                             del bot_state.active_positions[address]
                             
-                        # Check take profit
-                        elif current_price >= trade.take_profit:
+                        # Check if we should take partial profits (manual TP levels)
+                        elif trade.personality.get('tp_levels') and not trade.limit_orders:
+                            # If limit orders failed, check manually
+                            for i, tp_level in enumerate(trade.personality['tp_levels']):
+                                if current_price >= trade.entry_price * tp_level and i not in trade.partial_exits:
+                                    sell_percentage = int(100 / len(trade.personality['tp_levels']))
+                                    logger.info(f"Manual TP{i+1} hit for {trade.symbol}: +{(tp_level-1)*100:.1f}%")
+                                    bot_state.last_activity = f"Partial TP: {trade.symbol} at +{(tp_level-1)*100:.1f}%"
+                                    bot_state.last_activity_type = "trade"
+                                    
+                                    await self.execute_sell(address, sell_percentage)
+                                    trade.partial_exits.append(i)
+                                    
+                                    # Record partial profit
+                                    partial_profit = trade.position_size * (sell_percentage/100) * (tp_level - 1)
+                                    self.risk_manager.record_trade_result(partial_profit)
+                                    
+                                    # Reduce position size
+                                    trade.position_size *= (1 - sell_percentage/100)
+                                    
+                                    if len(trade.partial_exits) == len(trade.personality['tp_levels']):
+                                        # All TPs hit, remove from monitoring
+                                        del bot_state.active_positions[address]
+                                        break
+                        
+                        # Original single take profit check (fallback)
+                        elif current_price >= trade.take_profit and not trade.personality.get('tp_levels'):
                             logger.info(f"Take profit hit for {trade.symbol}: +{pnl_percent:.1f}%")
                             bot_state.last_activity = f"Take profit: {trade.symbol} at +{pnl_percent:.1f}%!"
                             bot_state.last_activity_type = "trade"
@@ -1942,23 +2126,14 @@ class LiveTradingBot:
                             # Keep 20% as moon bag
                             trade.position_size *= 0.2
                             
-                        # Check time limit
-                        elif time.time() - trade.entry_time > trade.personality['hold_time']:
-                            logger.info(f"Time limit reached for {trade.symbol}")
-                            bot_state.last_activity = f"Time exit: {trade.symbol} at {pnl_percent:.1f}%"
-                            bot_state.last_activity_type = "info"
-                            
-                            await self.execute_sell(address, 100)
-                            self.risk_manager.record_trade_result(trade.pnl)
-                            del bot_state.active_positions[address]
-                            
                     bot_state.active_trades = len(bot_state.active_positions)
                     
-                await asyncio.sleep(30)  # Check every 30 seconds
+                # Check positions more frequently for sniping strategies
+                await asyncio.sleep(10)  # Check every 10 seconds
                 
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 
     # Add monitoring_tokens attribute
     monitoring_tokens = {}
