@@ -24,6 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('TradingBot')
 
+# Support alternative environment variable names
+TELEGRAM_API_ID = os.environ.get('TELEGRAM_API_ID', os.environ.get('TG_API_ID', '023200589'))
+TELEGRAM_API_HASH = os.environ.get('TELEGRAM_API_HASH', os.environ.get('TG_API_HASH', 'ece533b0e33fe29f8184af0322143869'))
 # Try to import Telegram
 try:
     from telethon import TelegramClient, events
@@ -34,10 +37,10 @@ except ImportError:
     logger.warning("Telegram not available - install telethon to enable trading")
 
 # Configuration with SAFE DEFAULTS
-HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '')
-HELIUS_RPC_URL = os.environ.get('HELIUS_RPC_URL', '')
+HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '0f2e5160-d95a-46d7-a0c4-9a71484ab3d8')
+HELIUS_RPC_URL = os.environ.get('HELIUS_RPC_URL', '0f2e5160-d95a-46d7-a0c4-9a71484ab3d8')
 HELIUS_WEBHOOK_URL = os.environ.get('HELIUS_WEBHOOK_URL', '')  # For LaserStream
-HELIUS_SENDER_URL = os.environ.get('HELIUS_SENDER_URL', '')  # For Sender service
+HELIUS_SENDER_URL = os.environ.get('HELIUS_SENDER_URL', 'http://ewr-sender.helius-rpc.com/fast')  # For Sender service
 SOLANA_RPC_URL = HELIUS_RPC_URL if HELIUS_RPC_URL else 'https://api.mainnet-beta.solana.com'
 POSITION_SIZE = 0.01  # Start VERY small - 0.01 SOL per trade
 MIN_LIQUIDITY = 10  # Minimum 10 SOL liquidity for safety
@@ -1532,3 +1535,412 @@ class RiskManager:
         # Check if in cooldown after loss
         if bot_state.last_loss_time > 0:
             time_since_loss = time
+# ... (your existing code) ...
+
+class RiskManager:
+    """Manage trading risks and limits"""
+    
+    def __init__(self):
+        self.daily_loss_limit = MAX_DAILY_LOSS
+        self.max_position_size = MAX_POSITION_SIZE
+        self.min_wallet_balance = MIN_WALLET_BALANCE
+        self.cooldown_period = RISK_SETTINGS['cooldown_after_loss']
+        
+    def can_trade(self) -> Tuple[bool, str]:
+        """Check if we can place a new trade"""
+        
+        # Check daily loss limit
+        if bot_state.daily_loss >= self.daily_loss_limit:
+            bot_state.risk_status = "Daily loss limit reached"
+            return False, "Daily loss limit reached"
+            
+        # Check if in cooldown after loss
+        if bot_state.last_loss_time > 0:
+            time_since_loss = time.time() - bot_state.last_loss_time
+            if time_since_loss < self.cooldown_period:
+                remaining = int(self.cooldown_period - time_since_loss)
+                bot_state.risk_status = f"Cooldown: {remaining}s remaining"
+                return False, f"In cooldown for {remaining} seconds"
+            
+        # Check wallet balance
+        if bot_state.wallet_balance < self.min_wallet_balance:
+            bot_state.risk_status = "Insufficient balance"
+            return False, "Insufficient wallet balance"
+            
+        # Check max positions
+        if len(bot_state.active_positions) >= MAX_POSITIONS:
+            bot_state.risk_status = "Max positions reached"
+            return False, "Maximum positions reached"
+            
+        bot_state.risk_status = "Normal - Can trade"
+        return True, "OK"
+        
+    def calculate_position_size(self, personality: Dict) -> float:
+        """Calculate safe position size"""
+        base_size = personality['position_size']
+        
+        # Reduce size based on recent losses
+        if bot_state.daily_loss > 0:
+            loss_ratio = bot_state.daily_loss / self.daily_loss_limit
+            size_multiplier = 1 - (loss_ratio * 0.5)  # Reduce up to 50%
+            base_size *= size_multiplier
+            
+        # Never exceed max position size
+        return min(base_size, self.max_position_size)
+        
+    def record_trade_result(self, profit: float):
+        """Record trade result for risk management"""
+        if profit < 0:
+            bot_state.daily_loss += abs(profit)
+            bot_state.last_loss_time = time.time()
+            bot_state.losing_trades += 1
+        else:
+            bot_state.winning_trades += 1
+            
+        bot_state.total_trades += 1
+        bot_state.total_profit += profit
+
+class LiveTradingBot:
+    """Live trading bot with safety measures"""
+    
+    def __init__(self):
+        self.running = False
+        self.api_id = None
+        self.api_hash = None
+        self.client = None
+        self.phone = None
+        self.code_hash = None
+        self.toxibot_chat = None
+        self.token_discovery = TokenDiscovery()
+        self.price_checker = PriceChecker()
+        self.risk_manager = RiskManager()
+        self.contract_checker = ContractChecker()
+        self.last_balance_check = 0
+        self.monitoring_tokens = {}  # Initialize here
+        
+    async def setup_telegram(self, api_id: str, api_hash: str):
+        """Save Telegram credentials"""
+        self.api_id = api_id
+        self.api_hash = api_hash
+        bot_state.configured = True
+        logger.info("Telegram credentials saved")
+        return True
+        
+    async def send_code(self, phone: str):
+        """Send verification code"""
+        if not TELEGRAM_AVAILABLE:
+            raise Exception("Telegram library not installed. Run: pip install telethon")
+            
+        try:
+            # Create new client
+            self.client = TelegramClient(
+                StringSession(), 
+                int(self.api_id), 
+                self.api_hash
+            )
+            
+            # Connect
+            await self.client.connect()
+            
+            # Send code
+            self.phone = phone
+            result = await self.client.send_code_request(phone)
+            self.code_hash = result.phone_code_hash
+            
+            logger.info(f"Code sent to {phone}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to send code: {e}")
+            if self.client:
+                await self.client.disconnect()
+            raise
+        
+    async def verify_code(self, code: str):
+        """Verify code and start bot"""
+        if not self.client or not self.phone or not self.code_hash:
+            raise Exception("Must request code first")
+            
+        try:
+            # Sign in
+            await self.client.sign_in(
+                self.phone, 
+                code, 
+                phone_code_hash=self.code_hash
+            )
+            
+            # Save session
+            session_string = self.client.session.save()
+            os.makedirs('data', exist_ok=True)
+            with open('data/session.txt', 'w') as f:
+                f.write(session_string)
+                
+            bot_state.authenticated = True
+            
+            # Find ToxiBot
+            await self.find_toxibot()
+            
+            # Start trading
+            self.running = True
+            bot_state.running = True
+            asyncio.create_task(self.trading_loop())
+            asyncio.create_task(self.monitor_toxibot_messages())
+            asyncio.create_task(self.monitor_positions())
+            
+            logger.info("Bot started successfully!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Verification failed: {e}")
+            raise
+            
+    async def find_toxibot(self):
+        """Find ToxiBot in Telegram chats"""
+        # Implementation continues...
+        pass
+        
+    async def execute_buy(self, token_address: str, amount_sol: float = POSITION_SIZE):
+        """Execute buy order through ToxiBot"""
+        # Implementation
+        pass
+        
+    async def execute_sell(self, token_address: str, amount_percent: int = 100):
+        """Execute sell order through ToxiBot"""
+        # Implementation
+        pass
+        
+    async def trading_loop(self):
+        """Main trading loop"""
+        # Implementation
+        pass
+        
+    async def monitor_toxibot_messages(self):
+        """Monitor ToxiBot responses"""
+        # Implementation
+        pass
+        
+    async def monitor_positions(self):
+        """Monitor open positions"""
+        # Implementation
+        pass
+        
+    def _parse_trade_result(self, message: str, is_loss: bool):
+        """Parse trade result from ToxiBot message"""
+        try:
+            # Extract token address and profit/loss amount
+            sol_match = re.search(r'(\d+\.?\d*)\s*SOL', message)
+            if sol_match:
+                amount = float(sol_match.group(1))
+                if is_loss:
+                    amount = -amount
+                self.risk_manager.record_trade_result(amount)
+                
+            # Update trade statistics
+            if is_loss:
+                bot_state.losing_trades += 1
+            else:
+                bot_state.winning_trades += 1
+                
+            bot_state.total_trades += 1
+            
+        except Exception as e:
+            logger.error(f"Failed to parse trade result: {e}")
+
+# Create bot instance
+trading_bot = LiveTradingBot()
+
+class WebServer:
+    """Web server for the dashboard"""
+    
+    def __init__(self):
+        self.app = web.Application()
+        self.setup_routes()
+        
+    def setup_routes(self):
+        self.app.router.add_get('/', self.index)
+        self.app.router.add_get('/api/status', self.status)
+        self.app.router.add_post('/api/setup', self.setup)
+        self.app.router.add_post('/api/request-code', self.request_code)
+        self.app.router.add_post('/api/verify-code', self.verify_code)
+        self.app.router.add_get('/api/stats', self.stats)
+        
+    async def index(self, request):
+        return web.Response(text=DASHBOARD_HTML, content_type='text/html')
+        
+    async def status(self, request):
+        return web.json_response({
+            'configured': bot_state.configured,
+            'authenticated': bot_state.authenticated,
+            'running': bot_state.running,
+            'hasHeliusKey': bool(HELIUS_API_KEY)
+        })
+        
+    async def setup(self, request):
+        try:
+            data = await request.json()
+            api_id = data.get('api_id')
+            api_hash = data.get('api_hash')
+            
+            if not api_id or not api_hash:
+                return web.json_response({'error': 'Missing credentials'}, status=400)
+                
+            await trading_bot.setup_telegram(api_id, api_hash)
+            
+            return web.json_response({'status': 'success'})
+        except Exception as e:
+            logger.error(f"Setup error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+            
+    async def request_code(self, request):
+        try:
+            data = await request.json()
+            phone = data.get('phone')
+            
+            if not phone:
+                return web.json_response({'error': 'Phone number required'}, status=400)
+                
+            await trading_bot.send_code(phone)
+            
+            return web.json_response({'status': 'success'})
+        except Exception as e:
+            logger.error(f"Request code error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+            
+    async def verify_code(self, request):
+        try:
+            data = await request.json()
+            code = data.get('code')
+            
+            if not code:
+                return web.json_response({'error': 'Code required'}, status=400)
+                
+            await trading_bot.verify_code(code)
+            
+            return web.json_response({'status': 'success'})
+        except Exception as e:
+            logger.error(f"Verify code error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+            
+    async def stats(self, request):
+        win_rate = 0
+        if bot_state.total_trades > 0:
+            win_rate = int((bot_state.winning_trades / bot_state.total_trades) * 100)
+            
+        return web.json_response({
+            'profit': bot_state.total_profit,
+            'trades': bot_state.active_trades,
+            'winRate': win_rate,
+            'toxibotConnected': bot_state.toxibot_connected,
+            'tokensChecked': bot_state.tokens_checked,
+            'activity': bot_state.last_activity,
+            'activityType': bot_state.last_activity_type,
+            'walletBalance': bot_state.wallet_balance,
+            'riskStatus': bot_state.risk_status
+        })
+
+async def load_existing_session():
+    """Load existing Telegram session if available"""
+    try:
+        session_path = 'data/session.txt'
+        if os.path.exists(session_path):
+            logger.info(f"Found session file at {session_path}")
+            with open(session_path, 'r') as f:
+                session_string = f.read().strip()
+                
+            if session_string and TELEGRAM_AVAILABLE:
+                logger.info("Attempting to load existing session...")
+                # Get API credentials from environment
+                api_id = TELEGRAM_API_ID or os.environ.get('TG_API_ID')
+                api_hash = TELEGRAM_API_HASH or os.environ.get('TG_API_HASH')
+                
+                if not api_id or not api_hash:
+                    logger.warning("No Telegram API credentials in environment")
+                    return False
+                
+                # Try to connect with existing session
+                client = TelegramClient(StringSession(session_string), 
+                                      int(api_id), 
+                                      api_hash)
+                                      
+                await client.connect()
+                
+                if await client.is_user_authorized():
+                    logger.info("Session loaded successfully!")
+                    trading_bot.client = client
+                    trading_bot.api_id = api_id
+                    trading_bot.api_hash = api_hash
+                    bot_state.configured = True
+                    bot_state.authenticated = True
+                    
+                    # Find ToxiBot and start
+                    await trading_bot.find_toxibot()
+                    trading_bot.running = True
+                    bot_state.running = True
+                    
+                    # Start all background tasks
+                    asyncio.create_task(trading_bot.trading_loop())
+                    asyncio.create_task(trading_bot.monitor_toxibot_messages())
+                    asyncio.create_task(trading_bot.monitor_positions())
+                    
+                    logger.info("Bot fully started with existing session!")
+                    return True
+                else:
+                    logger.warning("Session expired, need to re-authenticate")
+                    await client.disconnect()
+                    # Remove invalid session
+                    os.remove(session_path)
+        else:
+            logger.info("No existing session found")
+                    
+    except Exception as e:
+        logger.error(f"Failed to load session: {e}")
+        
+    return False
+
+async def main():
+    """Start the bot"""
+    # Debug info
+    print("Starting bot...")
+    print(f"Environment variables found:")
+    print(f"- TG_API_ID: {'Yes' if os.environ.get('TG_API_ID') else 'No'}")
+    print(f"- TG_API_HASH: {'Yes' if os.environ.get('TG_API_HASH') else 'No'}")
+    print(f"- HELIUS_API_KEY: {'Yes' if os.environ.get('HELIUS_API_KEY') else 'No'}")
+    print(f"- PORT: {os.environ.get('PORT', 'Not set')}")
+    
+    # Try to load existing session
+    await load_existing_session()
+    
+    # Start web server
+    server = WebServer()
+    
+    port = int(os.environ.get('PORT', 8080))
+    runner = web.AppRunner(server.app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    print(f"""
+    ╔═══════════════════════════════════════╗
+    ║    SOLANA SAFE TRADING BOT V2.0       ║
+    ╠═══════════════════════════════════════╣
+    ║                                       ║
+    ║  Dashboard: http://localhost:{port}    ║
+    ║                                       ║
+    ╚═══════════════════════════════════════╝
+    
+    Bot is running on port {port}
+    """)
+    
+    # Keep running
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info("Shutting down safely...")
+        trading_bot.running = False
+        if trading_bot.client:
+            await trading_bot.client.disconnect()
+        await runner.cleanup()
+
+if __name__ == '__main__':
+    asyncio.run(main())
