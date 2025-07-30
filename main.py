@@ -1934,7 +1934,7 @@ async def load_existing_session():
     except Exception as e:
         logger.error(f"Failed to load session: {e}")
         logger.info("Session error - please use dashboard to authenticate")
-   async def load_existing_session():
+async def load_existing_session():
        
     """Load existing Telegram session if available"""
     try:
