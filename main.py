@@ -4,6 +4,38 @@ SOLANA TRADING BOT - FIXED VERSION WITH SAFETY MEASURES
 Includes real price checking, risk management, and proper error handling
 """
 
+import sys
+import os
+
+# Ensure unbuffered output
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# Disable cryptg to avoid SSL issues
+os.environ['TELETHON_USE_CRYPTG'] = '0'
+os.environ['PYTHONUNBUFFERED'] = '1'
+
+# Add error handling for imports
+try:
+    import asyncio
+    import json
+    import time
+    import logging
+    import random
+    import aiohttp
+    import re
+    from datetime import datetime, timedelta
+    from typing import Dict, List, Optional, Tuple
+    from aiohttp import web
+    from dataclasses import dataclass, field
+except ImportError as e:
+    print(f"Import error: {e}")
+    print("Installing missing packages...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    sys.exit(1)
+
+# Continue with rest of your code...
 import os
 # Disable cryptg to avoid SSL issues
 os.environ['TELETHON_USE_CRYPTG'] = '0'
