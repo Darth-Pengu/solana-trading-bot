@@ -1934,8 +1934,12 @@ async def load_existing_session():
     except Exception as e:
         logger.error(f"Failed to load session: {e}")
         logger.info("Session error - please use dashboard to authenticate")
-        
-    return False
+   async def load_existing_session():
+       
+    """Load existing Telegram session if available"""
+    try:
+        session_path = 'data/session.txt'
+        if os.path.exists(session_path):
             logger.info(f"Found session file at {session_path}")
             with open(session_path, 'r') as f:
                 session_string = f.read().strip()
