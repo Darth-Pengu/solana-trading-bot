@@ -1251,7 +1251,6 @@ class TokenDiscovery:
         # Always try free sources
         tokens.extend(await self.get_dexscreener_tokens())
         tokens.extend(await self.get_birdeye_tokens())
-        # tokens.extend(await self.get_jupiter_new_tokens())  # Temporarily disabled
         
         logger.info(f"Total tokens found before filtering: {len(tokens)}")
         
