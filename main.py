@@ -1251,7 +1251,7 @@ class TokenDiscovery:
         # Always try free sources
         tokens.extend(await self.get_dexscreener_tokens())
         tokens.extend(await self.get_birdeye_tokens())
-        tokens.extend(await self.get_jupiter_new_tokens())  # Add Jupiter
+        # tokens.extend(await self.get_jupiter_new_tokens())  # Temporarily disabled
         
         logger.info(f"Total tokens found before filtering: {len(tokens)}")
         
@@ -1349,7 +1349,7 @@ class TokenDiscovery:
                                     'symbol': token_info.get('mintSymbol', 'UNKNOWN'),
                                     'name': token_info.get('vsTokenSymbol', 'Unknown Token'),
                                     'liquidity': volume_24h / 100,  # Rough estimate
-                                    'age_minutes': 60,  # Jupiter doesn't provide age
+                                    'age_minutes': 60,  # Jupiter doesn\'t provide age
                                     'volume_24h': volume_24h,
                                     'price_usd': token_info.get('price', 0),
                                     'holders': 0,  # Not provided
